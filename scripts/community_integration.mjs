@@ -668,7 +668,84 @@ function structuredMentionForTarget(targetAgentId, targetAgent) {
   };
 }
 
+function responseModeLabel(mode) {
+  return (
+    {
+      task: "??",
+      status: "??",
+      discussion: "??",
+      decision: "??",
+      chat: "??",
+      unknown: "??",
+      system: "????",
+      protocol_violation: "????",
+      workflow_contract: "????",
+      channel_context: "?????",
+    }[String(mode || "").trim()] || "??"
+  );
+}
+
+function decideCommunityResponse(obligation, mode, decisionContext = {}) {
+  const contextFlags = decisionContext?.contextFlags || {};
+
+  if (mode === "task" && obligation !== "observe_only" && (contextFlags.targeted_self || contextFlags.assigned_self || contextFlags.authorize)) {
+    return { action: "task_execution", reason: "directed_task" };
+  }
+
+  if (obligation === "required") {
+    return { action: mode === "task" ? "task_execution" : contextFlags.question ? "full_reply" : "brief_reply", reason: "required_obligation" };
+  }
+  if (obligation === "required_ack") {
+    return { action: contextFlags.question ? "brief_reply" : "ack", reason: "required_ack" };
+  }
+  if (obligation === "optional") {
+    if (["discussion", "decision", "chat"].includes(mode)) {
+      return { action: contextFlags.question ? "full_reply" : "brief_reply", reason: "optional_dialogue" };
+    }
+    if (["status", "unknown", "system"].includes(mode)) {
+      return {
+        action: contextFlags.addressed || contextFlags.question || contextFlags.need_ack ? "ack" : "observe_only",
+        reason: "optional_signal",
+      };
+    }
+    if (mode === "task") {
+      return {
+        action: contextFlags.addressed || contextFlags.assignment ? "brief_reply" : "observe_only",
+        reason: "optional_task",
+      };
+    }
+  }
+  return { action: "observe_only", reason: "observe_only_default" };
+}
+
+function buildFallbackReplyText(message, state, runtimeContext, dispatchContext = {}) {
+  const responseDecision = dispatchContext?.responseDecision || { action: "observe_only" };
+  const contextFlags = dispatchContext?.contextFlags || {};
+  const mode = dispatchContext?.mode || dispatchContext?.category || "unknown";
+  const label = responseModeLabel(mode);
+  const displayName = state?.profile?.display_name || state?.agentName || "OpenClaw Agent";
+
+  if (responseDecision.action === "ack") {
+    return `?????${label}???????????????????????? ${displayName} ??????`;
+  }
+  if (responseDecision.action === "brief_reply") {
+    if (contextFlags.question) {
+      return `?????${label}??????????????????????????????????????????`;
+    }
+    return `?????${label}??????????????????????????????`;
+  }
+  if (responseDecision.action === "full_reply") {
+    return `?????${label}?????????????????????????????????????`;
+  }
+  return "";
+}
+
+async function generateCommunityReply(message, state, runtimeContext, dispatchContext = {}) {
+  return buildFallbackReplyText(message, state, runtimeContext, dispatchContext);
+}
+
 function pruneNullish(value) {
+
   if (Array.isArray(value)) {
     return value
       .map((item) => pruneNullish(item))
@@ -853,6 +930,9 @@ export async function receiveCommunityEvent(state, event) {
       handleProtocolViolation,
       loadWorkflowContract,
       loadChannelContext,
+      decideResponse: decideCommunityResponse,
+      generateReply: generateCommunityReply,
+      buildFallbackReplyText,
     },
     state,
     event,

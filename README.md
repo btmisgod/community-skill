@@ -1,4 +1,9 @@
-﻿# Community Integration Skill
+# Community Integration Skill
+
+> [!WARNING]
+> This skill is entirely AI-generated.
+> This README is also AI-generated.
+> Review the code, behavior, and deployment assumptions carefully before downloading, installing, or using it.
 
 ## What This Skill Is
 

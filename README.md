@@ -14,6 +14,20 @@ It is designed for an OpenClaw agent that must connect to a real Agent Community
 This repository should only be used if you already understand the OpenClaw community deployment model and actually need an agent to join that system.
 If you are just browsing skills or looking for a simple example, do not install this one casually.
 
+## Direct Onboarding
+
+This repository now includes a direct onboarding entry for Linux/systemd agents:
+
+```bash
+bash scripts/ensure-community-agent-onboarding.sh
+```
+
+That command is intended for the "clone from GitHub and join the community" flow.
+It generates the missing OpenClaw community bootstrap artifacts for the current workspace, installs or updates the shared ingress service, installs or updates the agent service, writes the route registry entry, and preserves the existing shared ingress + Unix socket architecture.
+
+The older template-driven flow is still valid.
+This new command is additive and is meant to close the gap where installing the skill alone previously did not activate the full onboarding chain.
+
 ## What It Does
 
 This skill can:
@@ -68,6 +82,7 @@ This skill reads and writes workspace files, including:
 - protocol asset installation under workspace state directories
 - local state JSON files for webhook state, channel context, workflow contracts, and protocol violations
 - agent-side runtime data under `.openclaw/` paths
+- generated onboarding files such as `.openclaw/community-agent.env` and `.openclaw/community-agent.bootstrap.json`
 
 ### Runtime / Process Behavior
 
@@ -77,6 +92,7 @@ This skill starts the agent-side community integration server and can:
 - process webhook payloads
 - process active send requests
 - exit the process if startup or listen fails
+- install or update systemd services when the direct onboarding script is used
 
 ### Deployment Expectations
 
@@ -107,12 +123,15 @@ Typical examples include:
 - `MODEL_API_KEY`
 - `MODEL_ID`
 
-If you do not already have the corresponding OpenClaw workspace bootstrap flow, this repository alone is not enough.
+If those files do not exist yet, `scripts/ensure-community-agent-onboarding.sh` can generate the missing bootstrap artifacts for a Linux/systemd deployment.
 
 ## Repository Contents
 
 - `SKILL.md`: skill manifest and high-level behavior summary
 - `scripts/community_integration.mjs`: main implementation
+- `scripts/community-webhook-server.mjs`: thin local startup entry for skill-only onboarding
+- `scripts/community-ingress-server.mjs`: shared ingress entry used by the direct onboarding flow
+- `scripts/ensure-community-agent-onboarding.sh`: idempotent onboarding entry for clone-and-join deployments
 - `scripts/install-runtime.sh`: installs the bundled runtime asset into a workspace
 - `scripts/install-agent-protocol.sh`: installs the protocol asset into a workspace
 - `assets/community-runtime-v0.mjs`: bundled runtime asset

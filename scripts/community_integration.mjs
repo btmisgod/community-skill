@@ -18,21 +18,29 @@ function slugifyHandle(value) {
   return base || `agent-${Date.now().toString().slice(-6)}`;
 }
 
+function shortSocketPath(ingressHome, agentSlug) {
+  const normalizedSlug = slugifyHandle(agentSlug);
+  const slugPrefix = normalizedSlug.slice(0, 24) || "agent";
+  const hash = crypto.createHash("sha256").update(normalizedSlug).digest("hex").slice(0, 12);
+  return path.join(ingressHome, "sockets", `${slugPrefix}-${hash}.sock`);
+}
+
 const WORKSPACE = process.env.WORKSPACE_ROOT || "/root/.openclaw/workspace";
 const TEMPLATE_HOME =
   process.env.COMMUNITY_TEMPLATE_HOME || path.join(WORKSPACE, ".openclaw", "community-agent-template");
+const INGRESS_HOME = process.env.COMMUNITY_INGRESS_HOME || "/root/.openclaw/community-ingress";
 const BASE_URL = process.env.COMMUNITY_BASE_URL || "http://127.0.0.1:8000/api/v1";
 const GROUP_SLUG = process.env.COMMUNITY_GROUP_SLUG || "public-lobby";
 const AGENT_NAME = process.env.COMMUNITY_AGENT_NAME || `openclaw-agent-${os.hostname()}`;
 const AGENT_SLUG = slugifyHandle(process.env.COMMUNITY_AGENT_HANDLE || AGENT_NAME);
 const AGENT_DESCRIPTION = process.env.COMMUNITY_AGENT_DESCRIPTION || "OpenClaw community-enabled agent";
-const TRANSPORT_MODE = process.env.COMMUNITY_TRANSPORT || "tcp";
+const TRANSPORT_MODE = process.env.COMMUNITY_TRANSPORT || "unix_socket";
 const LISTEN_HOST = process.env.COMMUNITY_WEBHOOK_HOST || "0.0.0.0";
 const LISTEN_PORT = Number(process.env.COMMUNITY_WEBHOOK_PORT || "8848");
 const WEBHOOK_PATH = process.env.COMMUNITY_WEBHOOK_PATH || `/webhook/${AGENT_SLUG}`;
 const SEND_PATH = process.env.COMMUNITY_SEND_PATH || `/send/${AGENT_SLUG}`;
 const AGENT_SOCKET_PATH =
-  process.env.COMMUNITY_AGENT_SOCKET_PATH || path.join(TEMPLATE_HOME, "run", `${AGENT_SLUG}.sock`);
+  process.env.COMMUNITY_AGENT_SOCKET_PATH || shortSocketPath(INGRESS_HOME, AGENT_SLUG);
 const WEBHOOK_PUBLIC_HOST = process.env.COMMUNITY_WEBHOOK_PUBLIC_HOST || "127.0.0.1";
 const WEBHOOK_PUBLIC_URL = process.env.COMMUNITY_WEBHOOK_PUBLIC_URL || "";
 const RESET_STATE_ON_START = process.env.COMMUNITY_RESET_STATE_ON_START === "1";

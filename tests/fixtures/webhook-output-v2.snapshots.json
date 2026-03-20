@@ -1,0 +1,609 @@
+{
+  "discussion": {
+    "event": {
+      "type": "message.posted",
+      "id": null,
+      "group_id": "group-1",
+      "aggregate_type": null,
+      "aggregate_id": null,
+      "actor_agent_id": null,
+      "created_at": null
+    },
+    "context": {
+      "group_id": "group-1",
+      "thread_id": "thread-1",
+      "task_id": null,
+      "parent_message_id": null,
+      "author_agent_id": "agent-other",
+      "runtime_context_loaded": true,
+      "flags": {
+        "mention": false,
+        "target": false,
+        "targeted_self": false,
+        "assignment": false,
+        "assigned_self": false,
+        "question": false,
+        "need_ack": false,
+        "authorize": false,
+        "task_signal": false,
+        "addressed": false
+      }
+    },
+    "message": {
+      "id": "msg-discussion",
+      "container": {
+        "group_id": "group-1"
+      },
+      "author": {
+        "agent_id": "agent-other"
+      },
+      "relations": {
+        "thread_id": "thread-1",
+        "parent_message_id": null,
+        "task_id": null
+      },
+      "body": {
+        "text": "Need thoughts on this proposal.",
+        "blocks": [],
+        "attachments": []
+      },
+      "semantics": {
+        "kind": "analysis",
+        "intent": "inform",
+        "topic": null
+      },
+      "routing": {
+        "target": {
+          "scope": null,
+          "agent_id": null,
+          "agent_label": null
+        },
+        "mentions": [],
+        "assignees": []
+      },
+      "extensions": {
+        "client_request_id": null,
+        "outbound_correlation_id": null,
+        "source": null,
+        "custom": {
+          "intent": "inform"
+        }
+      }
+    },
+    "runtime": {
+      "category": "discussion",
+      "mode": "discussion",
+      "reason": "discussion_signal",
+      "relevance": {
+        "value": false,
+        "reason": "not_targeted"
+      },
+      "obligation": {
+        "value": "optional",
+        "reason": "conversation_optional"
+      },
+      "actions": {
+        "decision": "brief_reply",
+        "should_reply": true,
+        "should_execute": false,
+        "should_sync_state": false,
+        "reason": "optional_default"
+      },
+      "handled": true,
+      "executed": true,
+      "observed": false,
+      "ignored": false,
+      "reply_id": "reply-1",
+      "result": null,
+      "payload": null,
+      "required_unfulfilled": false
+    }
+  },
+  "task": {
+    "event": {
+      "type": "message.posted",
+      "id": null,
+      "group_id": "group-1",
+      "aggregate_type": null,
+      "aggregate_id": null,
+      "actor_agent_id": null,
+      "created_at": null
+    },
+    "context": {
+      "group_id": "group-1",
+      "thread_id": null,
+      "task_id": "task-1",
+      "parent_message_id": null,
+      "author_agent_id": "agent-other",
+      "runtime_context_loaded": true,
+      "flags": {
+        "mention": true,
+        "target": true,
+        "targeted_self": true,
+        "assignment": true,
+        "assigned_self": true,
+        "question": false,
+        "need_ack": false,
+        "authorize": false,
+        "task_signal": true,
+        "addressed": true
+      }
+    },
+    "message": {
+      "id": "msg-task",
+      "container": {
+        "group_id": "group-1"
+      },
+      "author": {
+        "agent_id": "agent-other"
+      },
+      "relations": {
+        "thread_id": null,
+        "parent_message_id": null,
+        "task_id": "task-1"
+      },
+      "body": {
+        "text": "@Agent Self please execute this task.",
+        "blocks": [],
+        "attachments": []
+      },
+      "semantics": {
+        "kind": "proposal",
+        "intent": "request_action",
+        "topic": null
+      },
+      "routing": {
+        "target": {
+          "scope": "agent",
+          "agent_id": "agent-self",
+          "agent_label": "Agent Self"
+        },
+        "mentions": [
+          {
+            "mention_type": "agent",
+            "mention_id": "agent-self",
+            "display_text": "@Agent Self"
+          }
+        ],
+        "assignees": [
+          "agent-self"
+        ]
+      },
+      "extensions": {
+        "client_request_id": null,
+        "outbound_correlation_id": null,
+        "source": null,
+        "custom": {
+          "intent": "request_action",
+          "target_agent_id": "agent-self",
+          "target_agent": "Agent Self",
+          "assignees": [
+            "agent-self"
+          ]
+        }
+      }
+    },
+    "runtime": {
+      "category": "task",
+      "mode": "task",
+      "reason": "task_intent",
+      "relevance": {
+        "value": true,
+        "reason": "target_agent_id"
+      },
+      "obligation": {
+        "value": "required",
+        "reason": "task_directed_to_self"
+      },
+      "actions": {
+        "decision": "task_execution",
+        "should_reply": false,
+        "should_execute": true,
+        "should_sync_state": false,
+        "reason": "required_obligation"
+      },
+      "handled": true,
+      "executed": true,
+      "observed": false,
+      "ignored": false,
+      "reply_id": "reply-1",
+      "result": null,
+      "payload": null,
+      "required_unfulfilled": false
+    }
+  },
+  "status": {
+    "event": {
+      "type": "message.posted",
+      "id": null,
+      "group_id": "group-1",
+      "aggregate_type": null,
+      "aggregate_id": null,
+      "actor_agent_id": null,
+      "created_at": null
+    },
+    "context": {
+      "group_id": "group-1",
+      "thread_id": null,
+      "task_id": null,
+      "parent_message_id": null,
+      "author_agent_id": "agent-other",
+      "runtime_context_loaded": true,
+      "flags": {
+        "mention": false,
+        "target": false,
+        "targeted_self": false,
+        "assignment": false,
+        "assigned_self": false,
+        "question": false,
+        "need_ack": true,
+        "authorize": false,
+        "task_signal": false,
+        "addressed": false
+      }
+    },
+    "message": {
+      "id": "msg-status",
+      "container": {
+        "group_id": "group-1"
+      },
+      "author": {
+        "agent_id": "agent-other"
+      },
+      "relations": {
+        "thread_id": null,
+        "parent_message_id": null,
+        "task_id": null
+      },
+      "body": {
+        "text": "Progress update.",
+        "blocks": [],
+        "attachments": []
+      },
+      "semantics": {
+        "kind": "progress",
+        "intent": null,
+        "topic": null
+      },
+      "routing": {
+        "target": {
+          "scope": null,
+          "agent_id": null,
+          "agent_label": null
+        },
+        "mentions": [],
+        "assignees": []
+      },
+      "extensions": {
+        "client_request_id": null,
+        "outbound_correlation_id": null,
+        "source": null,
+        "custom": {}
+      }
+    },
+    "runtime": {
+      "category": "status",
+      "mode": "status",
+      "reason": "status_signal",
+      "relevance": {
+        "value": false,
+        "reason": "not_targeted"
+      },
+      "obligation": {
+        "value": "required_ack",
+        "reason": "status_ack_requested"
+      },
+      "actions": {
+        "decision": "ack",
+        "should_reply": true,
+        "should_execute": false,
+        "should_sync_state": false,
+        "reason": "required_ack_obligation"
+      },
+      "handled": true,
+      "executed": true,
+      "observed": false,
+      "ignored": false,
+      "reply_id": "reply-1",
+      "result": null,
+      "payload": null,
+      "required_unfulfilled": false
+    }
+  },
+  "decision": {
+    "event": {
+      "type": "message.posted",
+      "id": null,
+      "group_id": "group-1",
+      "aggregate_type": null,
+      "aggregate_id": null,
+      "actor_agent_id": null,
+      "created_at": null
+    },
+    "context": {
+      "group_id": "group-1",
+      "thread_id": null,
+      "task_id": null,
+      "parent_message_id": null,
+      "author_agent_id": "agent-other",
+      "runtime_context_loaded": true,
+      "flags": {
+        "mention": false,
+        "target": false,
+        "targeted_self": false,
+        "assignment": false,
+        "assigned_self": false,
+        "question": false,
+        "need_ack": false,
+        "authorize": false,
+        "task_signal": false,
+        "addressed": false
+      }
+    },
+    "message": {
+      "id": "msg-decision",
+      "container": {
+        "group_id": "group-1"
+      },
+      "author": {
+        "agent_id": "agent-other"
+      },
+      "relations": {
+        "thread_id": null,
+        "parent_message_id": null,
+        "task_id": null
+      },
+      "body": {
+        "text": "We approve the proposal.",
+        "blocks": [],
+        "attachments": []
+      },
+      "semantics": {
+        "kind": "decision",
+        "intent": null,
+        "topic": null
+      },
+      "routing": {
+        "target": {
+          "scope": null,
+          "agent_id": null,
+          "agent_label": null
+        },
+        "mentions": [],
+        "assignees": []
+      },
+      "extensions": {
+        "client_request_id": null,
+        "outbound_correlation_id": null,
+        "source": null,
+        "custom": {}
+      }
+    },
+    "runtime": {
+      "category": "decision",
+      "mode": "decision",
+      "reason": "decision_signal",
+      "relevance": {
+        "value": false,
+        "reason": "not_targeted"
+      },
+      "obligation": {
+        "value": "optional",
+        "reason": "conversation_optional"
+      },
+      "actions": {
+        "decision": "brief_reply",
+        "should_reply": true,
+        "should_execute": false,
+        "should_sync_state": false,
+        "reason": "optional_default"
+      },
+      "handled": true,
+      "executed": true,
+      "observed": false,
+      "ignored": false,
+      "reply_id": "reply-1",
+      "result": null,
+      "payload": null,
+      "required_unfulfilled": false
+    }
+  },
+  "self_echo": {
+    "event": {
+      "type": "message.posted",
+      "id": null,
+      "group_id": "group-1",
+      "aggregate_type": null,
+      "aggregate_id": null,
+      "actor_agent_id": null,
+      "created_at": null
+    },
+    "context": {
+      "group_id": "group-1",
+      "thread_id": null,
+      "task_id": null,
+      "parent_message_id": null,
+      "author_agent_id": "agent-self",
+      "runtime_context_loaded": false,
+      "flags": {
+        "mention": false,
+        "target": false,
+        "targeted_self": false,
+        "assignment": false,
+        "assigned_self": false,
+        "question": false,
+        "need_ack": false,
+        "authorize": false,
+        "task_signal": false,
+        "addressed": false
+      }
+    },
+    "message": {
+      "id": "msg-self",
+      "container": {
+        "group_id": "group-1"
+      },
+      "author": {
+        "agent_id": "agent-self"
+      },
+      "relations": {
+        "thread_id": null,
+        "parent_message_id": null,
+        "task_id": null
+      },
+      "body": {
+        "text": "This is my own message.",
+        "blocks": [],
+        "attachments": []
+      },
+      "semantics": {
+        "kind": "analysis",
+        "intent": null,
+        "topic": null
+      },
+      "routing": {
+        "target": {
+          "scope": null,
+          "agent_id": null,
+          "agent_label": null
+        },
+        "mentions": [],
+        "assignees": []
+      },
+      "extensions": {
+        "client_request_id": null,
+        "outbound_correlation_id": null,
+        "source": null,
+        "custom": {}
+      }
+    },
+    "runtime": {
+      "category": "self_message",
+      "mode": "self_message",
+      "reason": "self_echo",
+      "relevance": {
+        "value": false,
+        "reason": "self_echo"
+      },
+      "obligation": {
+        "value": "observe_only",
+        "reason": "state_sync_only"
+      },
+      "actions": {
+        "decision": "observe_only",
+        "should_reply": false,
+        "should_execute": false,
+        "should_sync_state": true,
+        "reason": "self_message_no_intake"
+      },
+      "handled": true,
+      "executed": false,
+      "observed": true,
+      "ignored": false,
+      "reply_id": null,
+      "result": null,
+      "payload": null,
+      "required_unfulfilled": false
+    }
+  },
+  "admin_message": {
+    "event": {
+      "type": "message.posted",
+      "id": null,
+      "group_id": "group-1",
+      "aggregate_type": null,
+      "aggregate_id": null,
+      "actor_agent_id": null,
+      "created_at": null
+    },
+    "context": {
+      "group_id": "group-1",
+      "thread_id": null,
+      "task_id": null,
+      "parent_message_id": null,
+      "author_agent_id": "admin-user",
+      "runtime_context_loaded": true,
+      "flags": {
+        "mention": false,
+        "target": false,
+        "targeted_self": false,
+        "assignment": false,
+        "assigned_self": false,
+        "question": false,
+        "need_ack": false,
+        "authorize": false,
+        "task_signal": false,
+        "addressed": true
+      }
+    },
+    "message": {
+      "id": "msg-admin",
+      "container": {
+        "group_id": "group-1"
+      },
+      "author": {
+        "agent_id": "admin-user"
+      },
+      "relations": {
+        "thread_id": null,
+        "parent_message_id": null,
+        "task_id": null
+      },
+      "body": {
+        "text": "Admin maintenance notice.",
+        "blocks": [],
+        "attachments": []
+      },
+      "semantics": {
+        "kind": "meta",
+        "intent": null,
+        "topic": null
+      },
+      "routing": {
+        "target": {
+          "scope": null,
+          "agent_id": null,
+          "agent_label": null
+        },
+        "mentions": [],
+        "assignees": []
+      },
+      "extensions": {
+        "client_request_id": null,
+        "outbound_correlation_id": null,
+        "source": null,
+        "custom": {
+          "system_event": true
+        }
+      }
+    },
+    "runtime": {
+      "category": "admin_message",
+      "mode": "admin_message",
+      "reason": "admin_signal",
+      "relevance": {
+        "value": true,
+        "reason": "system_scope"
+      },
+      "obligation": {
+        "value": "required_ack",
+        "reason": "system_ack_requested"
+      },
+      "actions": {
+        "decision": "ack",
+        "should_reply": true,
+        "should_execute": false,
+        "should_sync_state": false,
+        "reason": "required_ack_obligation"
+      },
+      "handled": true,
+      "executed": true,
+      "observed": false,
+      "ignored": false,
+      "reply_id": "reply-1",
+      "result": null,
+      "payload": null,
+      "required_unfulfilled": false
+    }
+  }
+}

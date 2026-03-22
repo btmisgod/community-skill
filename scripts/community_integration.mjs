@@ -433,17 +433,31 @@ function validateWebhookUrl(url) {
 }
 
 export function installRuntime() {
-  if (fs.existsSync(WORKSPACE_RUNTIME_PATH)) {
-    runtimeModulePromise = null;
-    return { installed: true, runtimePath: WORKSPACE_RUNTIME_PATH, source: "workspace" };
-  }
   if (!fs.existsSync(BUNDLED_RUNTIME_PATH)) {
     throw new Error(`Bundled runtime asset missing: ${BUNDLED_RUNTIME_PATH}`);
   }
   ensureDir(WORKSPACE_RUNTIME_PATH);
+  if (fs.existsSync(WORKSPACE_RUNTIME_PATH)) {
+    const current = fs.readFileSync(WORKSPACE_RUNTIME_PATH, "utf8");
+    const bundled = fs.readFileSync(BUNDLED_RUNTIME_PATH, "utf8");
+    if (current !== bundled) {
+      fs.copyFileSync(WORKSPACE_RUNTIME_PATH, WORKSPACE_RUNTIME_PATH + ".bak");
+      fs.copyFileSync(BUNDLED_RUNTIME_PATH, WORKSPACE_RUNTIME_PATH);
+      runtimeModulePromise = null;
+      return {
+        installed: true,
+        refreshed: true,
+        runtimePath: WORKSPACE_RUNTIME_PATH,
+        backupPath: WORKSPACE_RUNTIME_PATH + ".bak",
+        source: "skill_asset",
+      };
+    }
+    runtimeModulePromise = null;
+    return { installed: true, refreshed: false, runtimePath: WORKSPACE_RUNTIME_PATH, source: "workspace" };
+  }
   fs.copyFileSync(BUNDLED_RUNTIME_PATH, WORKSPACE_RUNTIME_PATH);
   runtimeModulePromise = null;
-  return { installed: true, runtimePath: WORKSPACE_RUNTIME_PATH, source: "skill_asset" };
+  return { installed: true, refreshed: true, runtimePath: WORKSPACE_RUNTIME_PATH, source: "skill_asset" };
 }
 
 export function installAgentProtocol() {
@@ -533,12 +547,42 @@ async function ensureRegisteredAgent(state) {
 
 async function ensureProfile(state) {
   const profile = buildProfile();
-  const updated = await request("/agents/me/profile", {
-    method: "PATCH",
-    token: state.token,
-    body: JSON.stringify({ profile }),
-  });
-  return { ...state, profileCompleted: true, profile, agentId: updated.id, agentName: updated.name };
+  try {
+    const updated = await request("/agents/me/profile", {
+      method: "PATCH",
+      token: state.token,
+      body: JSON.stringify({ profile }),
+    });
+    return {
+      ...state,
+      profileCompleted: true,
+      profileStatus: "synced",
+      profileLastError: null,
+      profile,
+      agentId: updated.id,
+      agentName: updated.name,
+    };
+  } catch (error) {
+    console.error(
+      JSON.stringify(
+        {
+          ok: false,
+          community_profile: "sync_failed",
+          agentId: state?.agentId || null,
+          error: error?.message || String(error),
+        },
+        null,
+        2,
+      ),
+    );
+    return {
+      ...state,
+      profileCompleted: false,
+      profileStatus: "failed",
+      profileLastError: error?.message || String(error),
+      profile,
+    };
+  }
 }
 
 export async function updateCommunityProfile(state, profileOverrides = null) {
@@ -625,11 +669,11 @@ export async function connectToCommunity(state) {
   nextState = await ensureRegisteredAgent(nextState);
   persistCommunityState(nextState, "registered");
   nextState = await ensureProfile(nextState);
-  persistCommunityState(nextState, "profile_synced");
+  persistCommunityState(nextState, nextState.profileStatus === "failed" ? "profile_failed" : "profile_synced");
   nextState = await ensureGroupMembership(nextState);
   persistCommunityState(nextState, "group_joined");
   nextState = await ensurePresence(nextState);
-  persistCommunityState(nextState, "presence_synced");
+  persistCommunityState(nextState, nextState.presenceStatus === "failed" ? "presence_failed" : "presence_synced");
   nextState = await ensureAgentWebhook(nextState);
   persistCommunityState(nextState, "webhook_registered");
   return nextState;

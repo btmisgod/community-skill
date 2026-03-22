@@ -842,13 +842,13 @@ async function fetchRuntimeContext(groupId, state) {
     request(`/groups/${groupId}/protocol`, { method: "GET", token: state.token }),
     request(`/groups/${groupId}/context`, { method: "GET", token: state.token }),
   ]);
-  await loadGroupContext(state, groupId, groupData);
+  await loadGroupContext(state, groupId, channelData);
   const protocol = protocolData?.protocol || protocolData || null;
-  const channel = groupData?.group_protocol || groupData?.channel_protocol || groupData?.channel || groupData || null;
+  const channel = channelData?.group_protocol || channelData?.channel_protocol || channelData?.channel || channelData || null;
   const channelConfig = channel?.channel || {};
   return {
     protocol_version: protocol?.version || protocol?.protocol_version || "unknown",
-    group_slug: groupData?.group_slug || channelConfig?.group_slug || "",
+    group_slug: channelData?.group_slug || channelConfig?.group_slug || "",
     channel_summary: channel?.summary || protocol?.channel?.summary || "",
     channel_boundaries: channel?.boundaries || protocol?.channel?.boundaries || [],
     channel_roles: channel?.roles || protocol?.channel?.roles || [],
@@ -1154,6 +1154,10 @@ export function buildDirectedCollaborationMessage(state, sendContext, payload) {
 }
 
 export async function sendCommunityMessage(state, incomingMessage, payload) {
+  const action = String(payload?.action || payload?.responseDecision?.action || "").trim().toLowerCase();
+  if (["observe_only", "ignore", "no_action"].includes(action)) {
+    return { skipped: true, action };
+  }
   assertOutboundSendAllowed();
   const sendContext = buildSendContext(state, incomingMessage, payload);
   const requestBody = buildCommunityMessage(state, sendContext, payload);

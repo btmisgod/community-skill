@@ -25,69 +25,53 @@ const state = {
   profile: { display_name: "Agent Self", handle: "agent-self" },
 };
 
-function cleanupFiles() {
-  fs.rmSync(tempRoot, { recursive: true, force: true });
-}
-
 test.after(() => {
-  cleanupFiles();
+  fs.rmSync(tempRoot, { recursive: true, force: true });
 });
 
-test("buildCommunityMessage emits canonical V2 without duplicated semantic shadow fields", () => {
-  const sendContext = {
+test("buildCommunityMessage emits current canonical community message shape", () => {
+  const message = integration.buildCommunityMessage(state, {
     group_id: "group-1",
     thread_id: "thread-1",
     parent_message_id: "parent-1",
-    task_id: "task-1",
     target_agent_id: "agent-target",
     target_agent: "Agent Target",
-    assignees: ["agent-target"],
-  };
-
-  const message = integration.buildCommunityMessage(state, sendContext, {
+  }, {
+    flow_type: "run",
     message_type: "analysis",
     content: {
       text: "Please take a look.",
       metadata: {
         intent: "request_action",
-        topic: "review",
-        target_agent_id: "agent-target",
-        target_agent: "Agent Target",
-        assignees: ["agent-target"],
         custom_flag: true,
       },
     },
   });
 
-  assert.equal(message.container.group_id, "group-1");
+  assert.equal(message.group_id, "group-1");
+  assert.equal(message.author.agent_id, "agent-self");
+  assert.equal(message.flow_type, "run");
+  assert.equal(message.message_type, "analysis");
+  assert.equal(message.content.text, "Please take a look.");
   assert.equal(message.relations.thread_id, "thread-1");
   assert.equal(message.relations.parent_message_id, "parent-1");
-  assert.equal(message.relations.task_id, "task-1");
-  assert.equal(message.body.text, "Please take a look.");
-  assert.equal(message.semantics.kind, "analysis");
-  assert.equal(message.semantics.intent, "request_action");
-  assert.equal(message.semantics.topic, "review");
   assert.equal(message.routing.target.agent_id, "agent-target");
-  assert.equal(message.routing.target.agent_label, "Agent Target");
-  assert.deepEqual(message.routing.assignees, ["agent-target"]);
+  assert.ok(Array.isArray(message.routing.mentions));
   assert.equal(message.extensions.source, "CommunityIntegrationSkill");
   assert.ok(message.extensions.client_request_id);
   assert.ok(message.extensions.outbound_correlation_id);
   assert.equal(message.extensions.custom.custom_flag, true);
-  assert.equal(message.extensions.custom.intent, undefined);
-  assert.equal(message.extensions.custom.flow_type, undefined);
-  assert.equal(message.extensions.custom.message_type, undefined);
 });
 
-test("sendCommunityMessage posts canonical V2 body to /messages", async () => {
+test("sendCommunityMessage posts current canonical body to /messages", async () => {
   const sent = [];
   const originalFetch = global.fetch;
   global.fetch = async (url, options) => {
-    sent.push({ url, options, body: JSON.parse(options.body) });
+    sent.push({ url, body: JSON.parse(options.body) });
     return {
       ok: true,
       async text() {
-        return JSON.stringify({ success: true, data: { id: "msg-1", container: { group_id: "group-1" } } });
+        return JSON.stringify({ success: true, data: { id: "msg-1", group_id: "group-1" } });
       },
     };
   };
@@ -97,7 +81,6 @@ test("sendCommunityMessage posts canonical V2 body to /messages", async () => {
       group_id: "group-1",
       thread_id: "thread-1",
       parent_message_id: "parent-1",
-      task_id: "task-1",
       target_agent_id: "agent-target",
       target_agent: "Agent Target",
       content: {
@@ -113,54 +96,43 @@ test("sendCommunityMessage posts canonical V2 body to /messages", async () => {
     assert.equal(result.id, "msg-1");
     assert.equal(sent.length, 1);
     assert.equal(sent[0].url, "http://community.example/api/v1/messages");
-    assert.equal(sent[0].body.container.group_id, "group-1");
+    assert.equal(sent[0].body.group_id, "group-1");
     assert.equal(sent[0].body.relations.thread_id, "thread-1");
     assert.equal(sent[0].body.relations.parent_message_id, "parent-1");
-    assert.equal(sent[0].body.body.text, "Please take a look.");
-    assert.equal(sent[0].body.semantics.kind, "analysis");
-    assert.equal(sent[0].body.semantics.intent, "request_action");
+    assert.equal(sent[0].body.content.text, "Please take a look.");
     assert.equal(sent[0].body.routing.target.agent_id, "agent-target");
     assert.equal(sent[0].body.extensions.custom.custom_flag, true);
-    assert.equal(sent[0].body.extensions.custom.intent, undefined);
-    assert.equal(sent[0].body.extensions.custom.message_type, undefined);
   } finally {
     global.fetch = originalFetch;
   }
 });
 
-test("runtime accepts skill outbound canonical V2 message through webhook intake", async () => {
+test("runtime accepts canonical run message and replies when explicitly targeted", async () => {
   const outbound = integration.buildCommunityMessage(
     state,
     {
       group_id: "group-1",
       thread_id: "thread-1",
       parent_message_id: null,
-      task_id: null,
-      target_agent_id: null,
-      target_agent: null,
-      assignees: null,
+      target_agent_id: "agent-self",
+      target_agent: "Agent Self",
     },
     {
+      flow_type: "run",
       message_type: "analysis",
       content: {
-        text: "Need thoughts on this proposal.",
-        metadata: { intent: "inform" },
+        text: "Please review this and reply.",
+        metadata: { intent: "request_action" },
       },
     },
   );
 
   const adapter = {
     async fetchRuntimeContext() {
-      return { channel_roles: [{ agent: "agent-self", role: "builder" }] };
+      return { group_roles: [{ agent: "agent-self", role: "builder" }] };
     },
     async postCommunityMessage() {
       return { id: "reply-1" };
-    },
-    async executeTask() {
-      return "task completed";
-    },
-    async decideResponse() {
-      return { action: "brief_reply", reason: "test" };
     },
     async generateReply() {
       return "generated reply";
@@ -174,7 +146,7 @@ test("runtime accepts skill outbound canonical V2 message through webhook intake
     async loadWorkflowContract() {
       return { ok: true };
     },
-    async loadChannelContext() {
+    async loadGroupContext() {
       return { ok: true };
     },
   };
@@ -193,13 +165,13 @@ test("runtime accepts skill outbound canonical V2 message through webhook intake
     group_id: "group-1",
   });
 
-  assert.equal(result.message.container.group_id, "group-1");
-  assert.equal(result.message.body.text, "Need thoughts on this proposal.");
-  assert.equal(result.runtime.category, "discussion");
-  assert.equal(result.runtime.mode, "discussion");
+  assert.equal(result.category, "run");
+  assert.equal(result.obligation.obligation, "required");
+  assert.equal(result.signals.targeted, true);
+  assert.equal(result.posted, true);
 });
 
-test("receiveCommunityEvent keeps receipt/debug events outside normal intake while reading V2 payload references", async () => {
+test("receiveCommunityEvent keeps receipt/debug events outside normal intake", async () => {
   const receiptResult = await integration.receiveCommunityEvent(state, {
     event: {
       event_type: "message.accepted",
@@ -227,13 +199,12 @@ test("receiveCommunityEvent keeps receipt/debug events outside normal intake whi
     group_id: "group-1",
     thread_id: "thread-1",
     parent_message_id: null,
-    task_id: null,
     target_agent_id: null,
     target_agent: null,
-    assignees: null,
   }, {
+    flow_type: "run",
     message_type: "analysis",
-    content: { text: "canonicalized body", metadata: { intent: "inform" } },
+    content: { text: "canonicalized body" },
   });
 
   const debugResult = await integration.receiveCommunityEvent(state, {
@@ -253,8 +224,6 @@ test("receiveCommunityEvent keeps receipt/debug events outside normal intake whi
 
   assert.equal(receiptResult.category, "outbound_receipt");
   assert.equal(receiptResult.non_intake, true);
-  assert.equal(receiptResult.client_request_id, "req-1");
   assert.equal(debugResult.category, "outbound_debug");
   assert.equal(debugResult.non_intake, true);
-  assert.equal(debugResult.client_request_id, "req-2");
 });

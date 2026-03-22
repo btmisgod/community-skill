@@ -368,8 +368,8 @@ function buildProfile() {
   const soulDoc = loadText(path.join(ASSETS_DIR, "SOUL.md"));
   const displayName = firstNonEmpty(process.env.COMMUNITY_AGENT_DISPLAY_NAME, AGENT_NAME);
   const handle = slugifyHandle(firstNonEmpty(process.env.COMMUNITY_AGENT_HANDLE, displayName));
-  const identity = firstNonEmpty(process.env.COMMUNITY_AGENT_IDENTITY, "OpenClaw 协作 Agent");
-  const tagline = firstNonEmpty(process.env.COMMUNITY_AGENT_TAGLINE, AGENT_DESCRIPTION, "已接入社区协作总线");
+  const identity = firstNonEmpty(process.env.COMMUNITY_AGENT_IDENTITY, "OpenClaw 鍗忎綔 Agent");
+  const tagline = firstNonEmpty(process.env.COMMUNITY_AGENT_TAGLINE, AGENT_DESCRIPTION, "宸叉帴鍏ョぞ鍖哄崗浣滄€荤嚎");
   const bio = firstNonEmpty(
     process.env.COMMUNITY_AGENT_BIO,
     identityDoc.slice(0, 280),
@@ -562,22 +562,46 @@ async function ensureGroupMembership(state) {
   const result = await request(`/groups/by-slug/${GROUP_SLUG}/join`, {
     method: "POST",
     token: state.token,
-    body: JSON.stringify({ role: "member" }),
+    body: JSON.stringify({}),
   });
   return { ...state, groupId: result.group.id, groupSlug: result.group.slug };
 }
 
 async function ensurePresence(state) {
-  await request("/presence", {
-    method: "POST",
-    token: state.token,
-    body: JSON.stringify({
-      group_id: state.groupId,
-      state: "online",
-      note: "Community Integration Skill active",
-    }),
-  });
-  return state;
+  try {
+    await request("/presence", {
+      method: "POST",
+      token: state.token,
+      body: JSON.stringify({
+        group_id: state.groupId,
+        state: "online",
+        note: "Community Integration Skill active",
+      }),
+    });
+    return {
+      ...state,
+      presenceStatus: "synced",
+      presenceLastError: null,
+    };
+  } catch (error) {
+    console.error(
+      JSON.stringify(
+        {
+          ok: false,
+          community_presence: "sync_failed",
+          groupId: state?.groupId || null,
+          error: error?.message || String(error),
+        },
+        null,
+        2,
+      ),
+    );
+    return {
+      ...state,
+      presenceStatus: "failed",
+      presenceLastError: error?.message || String(error),
+    };
+  }
 }
 
 async function ensureAgentWebhook(state) {
@@ -626,14 +650,14 @@ function storedPayloadForGroup(filePath, groupId) {
   return state[String(groupId || "").trim()]?.payload || null;
 }
 
-export async function loadChannelContext(state, groupId, payload = null) {
+export async function loadGroupContext(state, groupId, payload = null) {
   const effectiveGroupId = String(groupId || "").trim();
   if (!effectiveGroupId) {
     return null;
   }
   let data = payload;
   if (!data) {
-    data = await request(`/groups/${effectiveGroupId}/channel-context`, { method: "GET", token: state.token });
+    data = await request(`/groups/${effectiveGroupId}/context`, { method: "GET", token: state.token });
   }
   return storeByGroup(CHANNEL_CONTEXT_PATH, effectiveGroupId, data);
 }
@@ -679,10 +703,10 @@ function loadModelConfig() {
 
 function runtimeInstructions(runtimeContext) {
   if (!runtimeContext || typeof runtimeContext !== "object") {
-    return "当前未能从 Community 获取运行时上下文。你只能基于明确任务，给出简洁、公开、可回到社区的执行结果。";
+    return "Unable to load runtime context from Community. Respond using only the explicit message, keep the output concise, public, and suitable for sending back into the community.";
   }
   return [
-    "以下是 Community 侧返回的运行时上下文摘要。你只需要据此完成当前任务，不要复述协议。",
+    "Community returned the following runtime context summary. Use it only to complete the current action and do not restate the protocol itself.",
     JSON.stringify(runtimeContext, null, 2),
   ].join("\n\n");
 }
@@ -698,7 +722,7 @@ function workflowContractInstructions(groupId) {
     return "";
   }
   return [
-    "以下是当前执行阶段的临时 workflow contract。它只在本次任务执行上下文中生效，不是永久身份设定。",
+    "The following is the temporary workflow contract for the current execution stage. It only applies to this task-local execution context and is not a permanent identity definition.",
     JSON.stringify(contract, null, 2),
   ].join("\n\n");
 }
@@ -709,7 +733,7 @@ function channelContextInstructions(groupId) {
     return "";
   }
   return [
-    "以下是当前频道的本地 channel context 缓存摘要。仅在当前执行中参考。",
+    "The following is the locally cached group context summary for the current group. Use it only as execution-time reference.",
     JSON.stringify(stored, null, 2),
   ].join("\n\n");
 }
@@ -724,15 +748,15 @@ function buildExecutionPrompt(message, state, runtimeContext) {
     {
       role: "system",
       content: [
-        `你是 OpenClaw 社区协作 agent：${state.profile?.display_name || state.agentName}。`,
-        "你当前是被 Agent Community 的 webhook 推送触发的，不是主动轮询。",
-        "你只负责产出公开可回传到社区频道的执行结果，不要输出内部推理过程。",
-        "不要虚构消息来源。当前消息来源就是 Agent Community webhook。",
+        `You are the OpenClaw community collaboration agent ${state.profile?.display_name || state.agentName}.`,
+        "You are responding because Agent Community delivered a webhook event.",
+        "Produce only a public result that can be sent back into the same group. Do not expose internal chain-of-thought.",
+        "Do not invent message sources. The current source is Agent Community webhook delivery.",
         agentProtocol,
         runtimeInstructions(runtimeContext),
         channelContextInstructions(message?.group_id),
         workflowContractInstructions(message?.group_id),
-        "以下是你的身份和工作上下文：",
+        "Identity and working context:",
         identity,
         soul,
         user,
@@ -742,7 +766,7 @@ function buildExecutionPrompt(message, state, runtimeContext) {
     },
     {
       role: "user",
-      content: `请根据下面这条社区消息，生成一条适合公开回到同一讨论串里的中文结果正文，只输出结果正文。\n\n消息类型: ${message.message_type}\n消息内容: ${JSON.stringify(message.content, null, 2)}`,
+      content: `Based on the following community message, generate a concise public Chinese reply body only.\n\nmessage_type: ${message.message_type}\nmessage_content: ${JSON.stringify(message.content, null, 2)}` ,
     },
   ];
 }
@@ -766,21 +790,21 @@ async function executeTask(message, state, runtimeContext) {
   if (!response.ok) {
     throw new Error(`Model request failed: ${JSON.stringify(payload)}`);
   }
-  return payload.choices?.[0]?.message?.content?.trim() || "我已收到社区消息，正在跟进。";
+  return payload.choices?.[0]?.message?.content?.trim() || "我已收到社区消息，正在继续跟进。";
 }
 
 async function fetchRuntimeContext(groupId, state) {
   const [protocolData, channelData] = await Promise.all([
     request(`/groups/${groupId}/protocol`, { method: "GET", token: state.token }),
-    request(`/groups/${groupId}/channel-context`, { method: "GET", token: state.token }),
+    request(`/groups/${groupId}/context`, { method: "GET", token: state.token }),
   ]);
-  await loadChannelContext(state, groupId, channelData);
+  await loadGroupContext(state, groupId, groupData);
   const protocol = protocolData?.protocol || protocolData || null;
-  const channel = channelData?.channel_protocol || channelData?.channel || channelData || null;
+  const channel = groupData?.group_protocol || groupData?.channel_protocol || groupData?.channel || groupData || null;
   const channelConfig = channel?.channel || {};
   return {
     protocol_version: protocol?.version || protocol?.protocol_version || "unknown",
-    group_slug: channelData?.group_slug || channelConfig?.group_slug || "",
+    group_slug: groupData?.group_slug || channelConfig?.group_slug || "",
     channel_summary: channel?.summary || protocol?.channel?.summary || "",
     channel_boundaries: channel?.boundaries || protocol?.channel?.boundaries || [],
     channel_roles: channel?.roles || protocol?.channel?.roles || [],
@@ -790,10 +814,10 @@ async function fetchRuntimeContext(groupId, state) {
 
 function inferIntentFromText(text) {
   const source = String(text || "");
-  if (/请|开始|继续|执行|修复|确认|提交|补充|跟进/.test(source)) {
+  if (/璇穦寮€濮媩缁х画|鎵ц|淇|纭|鎻愪氦|琛ュ厖|璺熻繘/.test(source)) {
     return "request_action";
   }
-  if (/验收|concluded|关闭|闭环|决定|批准|授权/.test(source)) {
+  if (/楠屾敹|concluded|鍏抽棴|闂幆|鍐冲畾|鎵瑰噯|鎺堟潈/.test(source)) {
     return "decide";
   }
   return "inform";
@@ -801,19 +825,16 @@ function inferIntentFromText(text) {
 
 function inferFlowType(messageType, intent) {
   const loweredType = String(messageType || "").trim().toLowerCase();
-  if (intent === "request_action") {
-    return "task";
+  if (loweredType === "proposal") {
+    return "start";
   }
-  if (loweredType === "decision" || intent === "decide") {
-    return "decision";
+  if (loweredType === "decision" || loweredType === "summary" || intent === "decide") {
+    return "result";
   }
   if (["summary", "progress"].includes(loweredType)) {
     return "status";
   }
-  if (["question", "chat"].includes(loweredType)) {
-    return "chat";
-  }
-  return "discussion";
+  return "run";
 }
 
 function normalizeOutboundMessageType(messageType) {
@@ -854,17 +875,16 @@ function structuredMentionForTarget(targetAgentId, targetAgent) {
 function responseModeLabel(mode) {
   return (
     {
-      task: "??",
-      status: "??",
-      discussion: "??",
-      decision: "??",
-      chat: "??",
-      unknown: "??",
-      system: "????",
-      protocol_violation: "????",
-      workflow_contract: "????",
-      channel_context: "?????",
-    }[String(mode || "").trim()] || "??"
+      start: "发起",
+      run: "协同中",
+      result: "结果",
+      status: "状态",
+      unknown: "未知",
+      system: "系统",
+      protocol_violation: "协议提醒",
+      workflow_contract: "合同更新",
+      group_context: "群组上下文",
+    }[String(mode || "").trim()] || "未知"
   );
 }
 
@@ -901,12 +921,17 @@ function canonicalMessageFromPayload(sendContext, payload, state) {
   delete legacyCustom.idempotency_key;
   delete legacyCustom.source;
   delete legacyCustom.mentions;
-  delete legacyCustom.task_id;
   delete legacyCustom.topic;
   delete legacyCustom.reply_to;
+
   const normalizedText = firstNonEmpty(body.text, legacyContent.text);
-  const normalizedKind = normalizeOutboundMessageType(source.message_type || semantics.kind || "analysis");
   const normalizedIntent = firstNonEmpty(semantics.intent, legacyContent.intent, legacyMetadata.intent, inferIntentFromText(normalizedText));
+  const normalizedFlowType =
+    firstNonEmpty(source.flow_type, semantics.flow_type, legacyMetadata.flow_type) ||
+    inferFlowType(source.message_type || semantics.message_type, normalizedIntent);
+  const normalizedMessageType = normalizeOutboundMessageType(
+    source.message_type || semantics.message_type || legacyMetadata.message_type || "analysis",
+  );
   const outboundCorrelationId = firstNonEmpty(
     extensions.outbound_correlation_id,
     extensions.client_request_id,
@@ -921,17 +946,6 @@ function canonicalMessageFromPayload(sendContext, payload, state) {
     firstNonEmpty(target.agent_id, source.target_agent_id, legacyMetadata.target_agent_id, sendContext?.target_agent_id) || null;
   const targetAgentLabel =
     firstNonEmpty(target.agent_label, source.target_agent, legacyMetadata.target_agent, sendContext?.target_agent) || null;
-  const assignees = listValue(routing.assignees).length
-    ? listValue(routing.assignees)
-    : listValue(source.assignees).length
-      ? listValue(source.assignees)
-      : listValue(legacyMetadata.assignees).length
-        ? listValue(legacyMetadata.assignees)
-        : listValue(sendContext?.assignees).length
-          ? listValue(sendContext.assignees)
-          : targetAgentId || targetAgentLabel
-            ? [targetAgentId || targetAgentLabel]
-            : [];
 
   const mentions = listValue(routing.mentions).length ? [...listValue(routing.mentions)] : [...listValue(legacyContent.mentions)];
   const mention = structuredMentionForTarget(targetAgentId, targetAgentLabel);
@@ -940,35 +954,27 @@ function canonicalMessageFromPayload(sendContext, payload, state) {
   }
 
   return pruneNullish({
-    container: {
-      group_id: sendContext.group_id,
-    },
+    group_id: sendContext.group_id,
     author: {
       agent_id: state?.agentId || null,
+    },
+    flow_type: normalizedFlowType,
+    message_type: normalizedMessageType,
+    content: {
+      text: normalizedText,
+      payload: dictValue(legacyContent.payload),
+      blocks: listValue(body.blocks),
+      attachments: listValue(body.attachments),
     },
     relations: {
       thread_id: sendContext.thread_id,
       parent_message_id: sendContext.parent_message_id,
-      task_id: sendContext.task_id,
-    },
-    body: {
-      text: normalizedText,
-      blocks: listValue(body.blocks),
-      attachments: listValue(body.attachments),
-    },
-    semantics: {
-      kind: normalizedKind,
-      intent: normalizedIntent,
-      topic: firstNonEmpty(semantics.topic, legacyMetadata.topic) || null,
     },
     routing: {
       target: {
-        scope: targetAgentId || targetAgentLabel ? firstNonEmpty(target.scope, "agent") : null,
         agent_id: targetAgentId,
-        agent_label: targetAgentLabel,
       },
       mentions,
-      assignees,
     },
     extensions: {
       client_request_id: firstNonEmpty(extensions.client_request_id, legacyMetadata.client_request_id, outboundCorrelationId),
@@ -976,6 +982,8 @@ function canonicalMessageFromPayload(sendContext, payload, state) {
       source: firstNonEmpty(extensions.source, legacyContent.source, legacyMetadata.source, "CommunityIntegrationSkill"),
       custom: {
         ...legacyCustom,
+        ...(normalizedIntent ? { intent: normalizedIntent } : {}),
+        ...(targetAgentLabel ? { target_agent_label: targetAgentLabel } : {}),
         ...custom,
         ...(firstNonEmpty(legacyMetadata.reply_to, sendContext.parent_message_id)
           ? { reply_to: firstNonEmpty(legacyMetadata.reply_to, sendContext.parent_message_id) }
@@ -988,31 +996,18 @@ function canonicalMessageFromPayload(sendContext, payload, state) {
 function decideCommunityResponse(obligation, mode, decisionContext = {}) {
   const contextFlags = decisionContext?.contextFlags || {};
 
-  if (mode === "task" && obligation !== "observe_only" && (contextFlags.targeted_self || contextFlags.assigned_self || contextFlags.authorize)) {
-    return { action: "task_execution", reason: "directed_task" };
-  }
-
   if (obligation === "required") {
-    return { action: mode === "task" ? "task_execution" : contextFlags.question ? "full_reply" : "brief_reply", reason: "required_obligation" };
+    return { action: contextFlags.question ? "full_reply" : "brief_reply", reason: "required_obligation" };
   }
   if (obligation === "required_ack") {
     return { action: contextFlags.question ? "brief_reply" : "ack", reason: "required_ack" };
   }
   if (obligation === "optional") {
-    if (["discussion", "decision", "chat"].includes(mode)) {
-      return { action: contextFlags.question ? "full_reply" : "brief_reply", reason: "optional_dialogue" };
+    if (["start", "run", "result"].includes(mode)) {
+      return { action: "observe_only", reason: "optional_collaboration" };
     }
     if (["status", "unknown", "system"].includes(mode)) {
-      return {
-        action: contextFlags.addressed || contextFlags.question || contextFlags.need_ack ? "ack" : "observe_only",
-        reason: "optional_signal",
-      };
-    }
-    if (mode === "task") {
-      return {
-        action: contextFlags.addressed || contextFlags.assignment ? "brief_reply" : "observe_only",
-        reason: "optional_task",
-      };
+      return { action: "observe_only", reason: "optional_signal" };
     }
   }
   return { action: "observe_only", reason: "observe_only_default" };
@@ -1069,14 +1064,12 @@ function pruneNullish(value) {
 function buildSendContext(state, incomingMessage, payload) {
   const metadata = payload?.content?.metadata && typeof payload.content.metadata === "object" ? payload.content.metadata : {};
   const relations = dictValue(payload?.relations);
-  const container = dictValue(payload?.container);
   const routing = dictValue(payload?.routing);
   const target = dictValue(routing.target);
   return {
-    group_id: payload?.group_id || container.group_id || incomingMessage?.group_id || state.groupId,
+    group_id: payload?.group_id || incomingMessage?.group_id || state.groupId,
     thread_id: payload?.thread_id || relations.thread_id || incomingMessage?.thread_id || incomingMessage?.id || null,
     parent_message_id: payload?.parent_message_id || relations.parent_message_id || incomingMessage?.id || null,
-    task_id: payload?.task_id || relations.task_id || incomingMessage?.task_id || null,
     target_agent_id: payload?.target_agent_id || target.agent_id || metadata.target_agent_id || incomingMessage?.agent_id || null,
     target_agent:
       payload?.target_agent ||
@@ -1085,13 +1078,6 @@ function buildSendContext(state, incomingMessage, payload) {
       incomingMessage?.agent_name ||
       incomingMessage?.source_agent_name ||
       null,
-    assignees: Array.isArray(payload?.assignees)
-      ? payload.assignees
-      : Array.isArray(routing.assignees)
-        ? routing.assignees
-        : Array.isArray(metadata.assignees)
-          ? metadata.assignees
-          : null,
   };
 }
 
@@ -1102,18 +1088,21 @@ export function buildCommunityMessage(state, sendContext, payload) {
 export function buildDirectedCollaborationMessage(state, sendContext, payload) {
   const normalizedPayload = {
     ...(payload && typeof payload === "object" ? payload : {}),
-    semantics: {
-      ...(dictValue(payload?.semantics)),
-      kind: normalizeOutboundMessageType(payload?.message_type || payload?.semantics?.kind || "analysis"),
-      intent: firstNonEmpty(payload?.semantics?.intent, payload?.content?.metadata?.intent, "request_action"),
-    },
+    flow_type: firstNonEmpty(payload?.flow_type, "run"),
+    message_type: normalizeOutboundMessageType(payload?.message_type || payload?.semantics?.kind || "analysis"),
     routing: {
       ...(dictValue(payload?.routing)),
       target: {
         ...(dictValue(payload?.routing?.target)),
-        scope:
-          firstNonEmpty(payload?.routing?.target?.scope) ||
-          (firstNonEmpty(payload?.target_agent_id, payload?.routing?.target?.agent_id) ? "agent" : null),
+        agent_id: firstNonEmpty(payload?.target_agent_id, payload?.routing?.target?.agent_id) || null,
+        agent_label: firstNonEmpty(payload?.target_agent, payload?.routing?.target?.agent_label) || null,
+      },
+    },
+    extensions: {
+      ...(dictValue(payload?.extensions)),
+      custom: {
+        ...(dictValue(payload?.extensions?.custom)),
+        intent: firstNonEmpty(payload?.semantics?.intent, payload?.content?.metadata?.intent, "request_action"),
       },
     },
   };
@@ -1124,12 +1113,12 @@ export async function sendCommunityMessage(state, incomingMessage, payload) {
   assertOutboundSendAllowed();
   const sendContext = buildSendContext(state, incomingMessage, payload);
   const requestBody = buildCommunityMessage(state, sendContext, payload);
-  const outboundText = String(requestBody?.body?.text || "").trim();
-  if (!requestBody?.container?.group_id || !outboundText) {
+  const outboundText = String(requestBody?.content?.text || "").trim();
+  if (!requestBody?.group_id || !outboundText) {
     recordInvalidOutbound("invalid_outbound_payload", {
-      group_id: requestBody?.container?.group_id || null,
+      group_id: requestBody?.group_id || null,
       has_text: Boolean(outboundText),
-      message_type: requestBody?.semantics?.kind || null,
+      message_type: requestBody?.message_type || null,
       client_request_id: requestBody?.extensions?.client_request_id || null,
     });
     throw new Error("invalid outbound community message payload");
@@ -1148,18 +1137,16 @@ function parseActiveSendPayload(raw) {
   const payload = raw && typeof raw === "object" ? raw : {};
   const content = payload.content && typeof payload.content === "object" ? { ...payload.content } : {};
   return {
-    group_id: payload.group_id || payload.container?.group_id || null,
+    group_id: payload.group_id || null,
     thread_id: payload.thread_id || payload.relations?.thread_id || null,
     parent_message_id: payload.parent_message_id || payload.relations?.parent_message_id || null,
-    task_id: payload.task_id || payload.relations?.task_id || null,
     target_agent_id: payload.target_agent_id || payload.routing?.target?.agent_id || null,
-    target_agent: payload.target_agent || payload.routing?.target?.agent_label || null,
-    assignees: Array.isArray(payload.assignees) ? payload.assignees : Array.isArray(payload.routing?.assignees) ? payload.routing.assignees : null,
-    message_type: payload.message_type || payload.semantics?.kind || "analysis",
+    target_agent: payload.target_agent || payload.routing?.target?.agent_label || payload.extensions?.custom?.target_agent_label || null,
+    flow_type: payload.flow_type || payload.semantics?.flow_type || "run",
+    message_type: payload.message_type || payload.semantics?.message_type || payload.semantics?.kind || "analysis",
     semantics: dictValue(payload.semantics),
     routing: dictValue(payload.routing),
     extensions: dictValue(payload.extensions),
-    body: dictValue(payload.body),
     content,
   };
 }
@@ -1169,26 +1156,16 @@ async function handleActiveSend(state, payload) {
   if (!normalized.group_id) {
     throw new Error("community-send requires group_id");
   }
-  if (!String(normalized.body?.text || normalized.content?.text || "").trim()) {
+  if (!String(normalized.content?.text || "").trim()) {
     throw new Error("community-send requires content.text");
   }
   return sendCommunityMessage(state, null, normalized);
 }
 
-function verifySignature(secret, rawBody, signature) {
-  const expected = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
-  if (!signature || signature.length !== expected.length) {
-    return false;
-  }
-  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature || ""));
-}
-
 async function loadRuntimeModule() {
-  if (!fs.existsSync(WORKSPACE_RUNTIME_PATH)) {
-    installRuntime();
-  }
   if (!runtimeModulePromise) {
-    runtimeModulePromise = import(pathToFileURL(WORKSPACE_RUNTIME_PATH).href);
+    const runtimeUrl = `${pathToFileURL(WORKSPACE_RUNTIME_PATH).href}?ts=${Date.now()}`;
+    runtimeModulePromise = import(runtimeUrl);
   }
   return runtimeModulePromise;
 }
@@ -1210,7 +1187,8 @@ export async function receiveCommunityEvent(state, event) {
       postCommunityMessage: sendCommunityMessage,
       handleProtocolViolation,
       loadWorkflowContract,
-      loadChannelContext,
+      loadGroupContext,
+      loadChannelContext: loadGroupContext,
       decideResponse: decideCommunityResponse,
       generateReply: generateCommunityReply,
       buildFallbackReplyText,
@@ -1406,3 +1384,9 @@ export async function startCommunityIntegration() {
   server.listen(LISTEN_PORT, LISTEN_HOST, onListening);
 }
 
+
+
+
+
+
+export const loadChannelContext = loadGroupContext;

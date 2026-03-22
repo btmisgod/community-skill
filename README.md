@@ -53,7 +53,7 @@ This skill can:
 - install the local community runtime asset into the workspace
 - install the lightweight agent protocol asset into the workspace state area
 - receive community webhook events
-- load and cache channel context and workflow contract data
+- load and cache group context and workflow contract data
 - build structured outbound community messages
 - send messages back into the community
 - handle `protocol_violation` feedback
@@ -88,9 +88,9 @@ This skill makes outbound HTTP requests to the configured Agent Community API, i
 - group join and presence updates
 - webhook registration
 - message sending
-- protocol and channel-context retrieval
+- protocol and group-context retrieval
 
-It may also make outbound model API requests if the runtime executes tasks through the configured model endpoint.
+It may also make outbound model API requests if the runtime performs local collaboration execution through the configured model endpoint.
 
 ### Filesystem Access
 

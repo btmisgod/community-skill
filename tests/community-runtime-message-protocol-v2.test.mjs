@@ -1,66 +1,37 @@
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import path from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
 
 process.env.MESSAGE_PROTOCOL_V2 = "1";
 process.env.WEBHOOK_RECEIPT_V2 = "1";
 
 const runtime = await import("../assets/community-runtime-v0.mjs");
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const state = {
   agentId: "agent-self",
   agentName: "Agent Self",
+  groupId: "group-1",
   profile: {
     display_name: "Agent Self",
     handle: "agent-self",
   },
 };
 
-const runtimeContext = {
-  channel_roles: [{ agent: "agent-self", role: "builder" }],
-};
-
 function baseAdapter() {
   return {
     async fetchRuntimeContext() {
-      return runtimeContext;
+      return { group_roles: [{ agent: "agent-self", role: "builder" }] };
     },
     async postCommunityMessage() {
       return { id: "reply-1" };
     },
-    async executeTask() {
-      return "task completed";
-    },
     async loadWorkflowContract() {
       return { ok: true };
     },
-    async loadChannelContext() {
+    async loadGroupContext() {
       return { ok: true };
     },
     async handleProtocolViolation() {
       return { ok: true };
-    },
-    async decideResponse(obligation, mode) {
-      if (mode === "self_message") {
-        return { action: "observe_only", reason: "self_message_no_reply" };
-      }
-      if (obligation === "required") {
-        return { action: mode === "task" ? "task_execution" : "brief_reply", reason: "required_obligation" };
-      }
-      if (obligation === "required_ack") {
-        return { action: "ack", reason: "required_ack_obligation" };
-      }
-      if (obligation === "optional") {
-        return {
-          action: ["discussion", "decision", "chat"].includes(mode) ? "brief_reply" : "observe_only",
-          reason: "optional_default",
-        };
-      }
-      return { action: "observe_only", reason: "observe_only_default" };
     },
     async generateReply() {
       return "generated reply";
@@ -71,138 +42,112 @@ function baseAdapter() {
   };
 }
 
-function legacyEvent(message) {
+function eventFor(message, eventType = "message.posted") {
   return {
-    event: { event_type: "message.posted", payload: { message } },
+    event: { event_type: eventType, payload: { message } },
     entity: { message },
     group_id: message.group_id,
   };
 }
 
-function v2MessageFromLegacy(message) {
-  const metadata = message.content?.metadata || {};
-  return {
-    id: message.id,
-    container: { group_id: message.group_id },
-    author: { agent_id: message.agent_id },
-    relations: {
-      thread_id: message.thread_id || null,
-      parent_message_id: message.parent_message_id || null,
-      task_id: message.task_id || metadata.task_id || null,
-    },
-    body: { text: message.content?.text || null, blocks: [], attachments: [] },
-    semantics: {
-      kind: message.message_type || null,
-      intent: message.content?.intent || metadata.intent || null,
-      topic: metadata.topic || null,
-    },
-    routing: {
-      target: {
-        scope: metadata.target_agent_id ? "agent" : null,
-        agent_id: metadata.target_agent_id || null,
-        agent_label: metadata.target_agent || null,
-      },
-      mentions: Array.isArray(message.content?.mentions) ? message.content.mentions : [],
-      assignees: Array.isArray(metadata.assignees) ? metadata.assignees : [],
-    },
-    extensions: {
-      client_request_id: metadata.client_request_id || null,
-      outbound_correlation_id: metadata.outbound_correlation_id || null,
-      source: metadata.source || null,
-      custom: metadata,
-    },
-  };
-}
-
-function v2Event(message) {
-  return {
-    event: { event_type: "message.posted", payload: { message } },
-    entity: { message },
-    group_id: message.container.group_id,
-  };
-}
-
-async function evaluate(event) {
-  return runtime.handleRuntimeEvent(baseAdapter(), state, event);
-}
-
-function summarize(result) {
-  return {
-    event: result.event,
-    context: result.context,
-    message: result.message,
-    runtime: result.runtime,
-  };
-}
-
-const fixtures = {
-  discussion: {
-    id: "msg-discussion",
+test("targeted run message becomes required", async () => {
+  const result = await runtime.handleRuntimeEvent(baseAdapter(), state, eventFor({
+    id: "msg-1",
     group_id: "group-1",
-    agent_id: "agent-other",
-    thread_id: "thread-1",
+    author: { agent_id: "agent-other" },
+    flow_type: "run",
     message_type: "analysis",
-    content: {
-      text: "Need thoughts on this proposal.",
-      metadata: { intent: "inform" },
-    },
-  },
-  task: {
-    id: "msg-task",
+    content: { text: "Please review this?" },
+    relations: { thread_id: "thread-1", parent_message_id: null },
+    routing: { target: { agent_id: "agent-self" }, mentions: [] },
+    extensions: {},
+  }));
+
+  assert.equal(result.category, "run");
+  assert.equal(result.obligation.obligation, "required");
+  assert.equal(result.signals.targeted, true);
+  assert.equal(result.posted, true);
+});
+
+test("visible non-targeted collaboration remains optional", async () => {
+  const result = await runtime.handleRuntimeEvent(baseAdapter(), state, eventFor({
+    id: "msg-2",
     group_id: "group-1",
-    agent_id: "agent-other",
-    task_id: "task-1",
+    author: { agent_id: "agent-other" },
+    flow_type: "start",
     message_type: "proposal",
-    content: {
-      text: "@Agent Self please execute this task.",
-      metadata: {
-        intent: "request_action",
-        target_agent_id: "agent-self",
-        target_agent: "Agent Self",
-        assignees: ["agent-self"],
-      },
-      mentions: [{ mention_type: "agent", mention_id: "agent-self", display_text: "@Agent Self" }],
-    },
-  },
-  status: {
-    id: "msg-status",
+    content: { text: "We should start a new round." },
+    relations: {},
+    routing: { target: null, mentions: [] },
+    extensions: {},
+  }));
+
+  assert.equal(result.category, "start");
+  assert.equal(result.obligation.obligation, "optional");
+  assert.equal(result.signals.targeted, false);
+});
+
+test("non-targeted collaboration question is still observed only", async () => {
+  const result = await runtime.handleRuntimeEvent(baseAdapter(), state, eventFor({
+    id: "msg-2b",
     group_id: "group-1",
-    agent_id: "agent-other",
+    author: { agent_id: "agent-other" },
+    flow_type: "run",
+    message_type: "analysis",
+    content: { text: "Can anyone review this?" },
+    relations: {},
+    routing: { target: null, mentions: [] },
+    extensions: {},
+  }));
+
+  assert.equal(result.category, "run");
+  assert.equal(result.obligation.obligation, "optional");
+  assert.equal(result.decision.action, "observe_only");
+  assert.equal(result.posted, undefined);
+});
+
+test("status is treated as community facility semantics", async () => {
+  const result = await runtime.handleRuntimeEvent(baseAdapter(), state, eventFor({
+    id: "msg-3",
+    group_id: "group-1",
+    author: { agent_id: "agent-other" },
+    flow_type: "status",
     message_type: "progress",
-    content: { text: "Progress update." },
-  },
-  decision: {
-    id: "msg-decision",
+    content: { text: "I am online and syncing." },
+    relations: {},
+    routing: { target: null, mentions: [] },
+    extensions: {},
+  }));
+
+  assert.equal(result.category, "status");
+  assert.equal(result.obligation.obligation, "observe_only");
+  assert.equal(result.signals.status, true);
+});
+
+test("group context update is observed without forced ack", async () => {
+  const result = await runtime.handleRuntimeEvent(baseAdapter(), state, {
+    event: { event_type: "group_context", payload: { group_id: "group-1" } },
+    entity: { group_id: "group-1" },
     group_id: "group-1",
-    agent_id: "agent-other",
-    message_type: "decision",
-    content: { text: "We approve the proposal." },
-  },
-  self_echo: {
-    id: "msg-self",
+  });
+
+  assert.equal(result.category, "group_context");
+  assert.equal(result.obligation.obligation, "observe_only");
+});
+
+test("self message is observed only", async () => {
+  const result = await runtime.handleRuntimeEvent(baseAdapter(), state, eventFor({
+    id: "msg-4",
     group_id: "group-1",
-    agent_id: "agent-self",
+    author: { agent_id: "agent-self" },
+    flow_type: "run",
     message_type: "analysis",
     content: { text: "This is my own message." },
-  },
-  admin_message: {
-    id: "msg-admin",
-    group_id: "group-1",
-    agent_id: "admin-user",
-    message_type: "meta",
-    content: { text: "Admin maintenance notice.", metadata: { system_event: true } },
-  },
-};
+    relations: {},
+    routing: { target: null, mentions: [] },
+    extensions: {},
+  }));
 
-const snapshotPath = path.join(__dirname, "fixtures", "webhook-output-v2.snapshots.json");
-const snapshots = JSON.parse(fs.readFileSync(snapshotPath, "utf8"));
-
-for (const [name, legacyMessage] of Object.entries(fixtures)) {
-  test(`${name} legacy and v2 payloads produce the same Webhook Output V2 snapshot`, async () => {
-    const legacyResult = summarize(await evaluate(legacyEvent(legacyMessage)));
-    const v2Result = summarize(await evaluate(v2Event(v2MessageFromLegacy(legacyMessage))));
-
-    assert.deepEqual(legacyResult, v2Result);
-    assert.deepEqual(v2Result, snapshots[name]);
-  });
-}
+  assert.equal(result.obligation.obligation, "observe_only");
+  assert.equal(result.signals.self_message, true);
+});

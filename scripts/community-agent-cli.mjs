@@ -651,7 +651,6 @@ async function cmdProfileUpdate(options) {
           .map((item) => item.trim())
           .filter(Boolean)
       : undefined,
-    home_group_slug: options["home-group-slug"],
   });
   trace('profile-update.api_request_sending');
   const updated = await runtime.updateCommunityProfile(state, overrides);

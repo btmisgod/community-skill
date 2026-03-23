@@ -43,6 +43,8 @@ const AGENT_SOCKET_PATH =
   process.env.COMMUNITY_AGENT_SOCKET_PATH || shortSocketPath(INGRESS_HOME, AGENT_SLUG);
 const WEBHOOK_PUBLIC_HOST = process.env.COMMUNITY_WEBHOOK_PUBLIC_HOST || "127.0.0.1";
 const WEBHOOK_PUBLIC_URL = process.env.COMMUNITY_WEBHOOK_PUBLIC_URL || "";
+const ALLOW_PRIVATE_WEBHOOK_URL = process.env.COMMUNITY_WEBHOOK_ALLOW_PRIVATE === "1";
+const WEBHOOK_IP_DISCOVERY_URLS = String(process.env.COMMUNITY_WEBHOOK_IP_DISCOVERY_URLS || "https://api.ipify.org,https://ifconfig.me/ip,https://api.ip.sb/ip").split(",").map((item) => item.trim()).filter(Boolean);
 const RESET_STATE_ON_START = process.env.COMMUNITY_RESET_STATE_ON_START === "1";
 
 const STATE_PATH = path.join(TEMPLATE_HOME, "state", "community-webhook-state.json");
@@ -440,7 +442,6 @@ function buildProfile() {
     avatar_text: avatarText,
     accent_color: accentColor || undefined,
     expertise,
-    home_group_slug: GROUP_SLUG,
   };
 }
 
@@ -478,18 +479,84 @@ function buildWebhookUrl() {
   return `http://${WEBHOOK_PUBLIC_HOST}:${LISTEN_PORT}${WEBHOOK_PATH}`;
 }
 
-function validateWebhookUrl(url) {
+function isPublicIpv4Host(hostname) {
+  return Boolean(hostname) && !isPrivateIpv4Host(hostname);
+}
+
+async function detectPublicIpv4() {
+  for (const url of WEBHOOK_IP_DISCOVERY_URLS) {
+    try {
+      const response = await fetch(url, { method: "GET" });
+      if (!response?.ok) {
+        continue;
+      }
+      const candidate = String(await response.text()).trim();
+      if (isPublicIpv4Host(candidate)) {
+        return candidate;
+      }
+    } catch {
+      // Try the next discovery endpoint.
+    }
+  }
+  return "";
+}
+
+async function resolveWebhookUrl() {
+  if (WEBHOOK_PUBLIC_URL.trim()) {
+    return WEBHOOK_PUBLIC_URL.trim();
+  }
+  if (isPublicIpv4Host(WEBHOOK_PUBLIC_HOST)) {
+    return `http://${WEBHOOK_PUBLIC_HOST}:${LISTEN_PORT}${WEBHOOK_PATH}`;
+  }
+  const detectedIp = await detectPublicIpv4();
+  if (detectedIp) {
+    return `http://${detectedIp}:${LISTEN_PORT}${WEBHOOK_PATH}`;
+  }
+  return buildWebhookUrl();
+}
+
+function isPrivateIpv4Host(hostname) {
+  const source = String(hostname || "").trim();
+  if (!source) {
+    return false;
+  }
+  const match = source.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!match) {
+    return false;
+  }
+  const octets = match.slice(1).map((value) => Number(value));
+  if (octets.some((value) => Number.isNaN(value) || value < 0 || value > 255)) {
+    return false;
+  }
+  return (
+    octets[0] === 10 ||
+    octets[0] === 127 ||
+    (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+    (octets[0] === 192 && octets[1] === 168)
+  );
+}
+
+export function validateWebhookUrl(url) {
   if (!url) {
     throw new Error("webhook public url is empty");
   }
-  if (url.includes("127.0.0.1") || url.includes("localhost")) {
+  const parsed = new URL(url);
+  const hostname = String(parsed.hostname || "").trim().toLowerCase();
+  const isLoopback = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+  const isPrivate = isPrivateIpv4Host(hostname);
+  if ((isLoopback || isPrivate) && !ALLOW_PRIVATE_WEBHOOK_URL) {
+    throw new Error(
+      `webhook public url is not publicly reachable: ${url}. Set COMMUNITY_WEBHOOK_PUBLIC_URL to a reachable address or set COMMUNITY_WEBHOOK_ALLOW_PRIVATE=1 if the community server can route to this private address.`,
+    );
+  }
+  if (isLoopback || isPrivate) {
     console.warn(
       JSON.stringify(
         {
           ok: false,
-          warning: "webhook_public_url_is_loopback",
+          warning: isLoopback ? "webhook_public_url_is_loopback" : "webhook_public_url_is_private",
           webhookUrl: url,
-          note: "Community server usually cannot deliver to loopback. Use a reachable host or domain.",
+          note: "Private or loopback webhook URLs only work when the community server can route to that address.",
         },
         null,
         2,
@@ -737,7 +804,7 @@ async function ensurePresence(state) {
 
 async function ensureAgentWebhook(state) {
   const webhookSecret = state.webhookSecret || randomSecret();
-  const webhookUrl = buildWebhookUrl();
+  const webhookUrl = await resolveWebhookUrl();
   validateWebhookUrl(webhookUrl);
   await request("/agents/me/webhook", {
     method: "POST",
@@ -1644,3 +1711,4 @@ export async function startCommunityIntegration() {
 
 
 export const loadChannelContext = loadGroupContext;
+

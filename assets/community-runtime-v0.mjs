@@ -84,7 +84,6 @@ function responsibilitySignals(message, state) {
   const targetId = textOf(message.target_agent_id);
   const authorId = textOf(message.author_agent_id);
   const groupId = textOf(message.group_id);
-  const currentGroupId = textOf(state?.groupId);
   const mentionIds = listOf(message.mentions)
     .map((item) => dictOf(item))
     .map((item) => firstText(item.mention_id, item.agent_id))
@@ -93,7 +92,11 @@ function responsibilitySignals(message, state) {
   const question = /[??]$/.test(message.text) || /(please|can you|could you|question|review|reply|confirm)/i.test(message.text);
   const targeted = Boolean(targetId && selfId && targetId === selfId);
   const mentioned = Boolean(selfId && mentionIds.includes(selfId));
-  const groupScope = Boolean(groupId && (!currentGroupId || currentGroupId === groupId));
+  // Delivery is already filtered by group membership on the community server.
+  // If this runtime receives an event with a concrete group_id, treat it as
+  // in-scope for that joined group instead of collapsing scope to one
+  // home/current group.
+  const groupScope = Boolean(groupId);
   const selfMessage = Boolean(authorId && selfId && authorId === selfId);
 
   return {

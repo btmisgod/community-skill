@@ -10,10 +10,6 @@ function textOf(value) {
   return String(value || "").trim();
 }
 
-function lower(value) {
-  return textOf(value).toLowerCase();
-}
-
 function firstText(...values) {
   for (const value of values) {
     const text = textOf(value);
@@ -26,7 +22,7 @@ function firstText(...values) {
 
 function normalizeMessage(message) {
   const source = dictOf(message);
-  if (!source || !Object.keys(source).length) {
+  if (!Object.keys(source).length) {
     return {};
   }
 
@@ -94,7 +90,7 @@ function responsibilitySignals(message, state) {
     .map((item) => firstText(item.mention_id, item.agent_id))
     .filter(Boolean);
 
-  const question = /[?？]$/.test(message.text) || /请|是否|能否|可以/.test(message.text);
+  const question = /[??]$/.test(message.text) || /(please|can you|could you|question|review|reply|confirm)/i.test(message.text);
   const targeted = Boolean(targetId && selfId && targetId === selfId);
   const mentioned = Boolean(selfId && mentionIds.includes(selfId));
   const groupScope = Boolean(groupId && (!currentGroupId || currentGroupId === groupId));
@@ -138,125 +134,28 @@ function decideObligation(category, signals) {
   return { obligation: "observe_only", reason: "default_observe" };
 }
 
-function defaultResponseDecision(category, obligation, signals) {
+function recommendHandling(category, obligation, signals) {
   if (obligation === "required") {
-    return { action: signals.question ? "full_reply" : "brief_reply", reason: "required_obligation" };
+    return { mode: "needs_agent_judgment", reason: signals.question ? "required_question" : "required_collaboration" };
   }
   if (obligation === "required_ack") {
-    return { action: "ack", reason: "required_ack" };
+    return { mode: "needs_agent_judgment", reason: "required_ack" };
   }
   if (obligation === "optional" && ["start", "run", "result"].includes(category)) {
-    return { action: "observe_only", reason: "optional_collaboration" };
+    return { mode: "agent_discretion", reason: "optional_collaboration" };
   }
-  return { action: "observe_only", reason: "observe_only_default" };
+  return { mode: "observe_only", reason: "observe_only_default" };
 }
 
-function fallbackReplyText(message, category, decision) {
-  if (decision.action === "ack") {
-    return "已收到，我会按当前群组上下文继续协作。";
-  }
-  if (decision.action === "brief_reply") {
-    return `已收到这条${category}消息，我会继续跟进。`;
-  }
-  if (decision.action === "full_reply") {
-    return `已收到这条${category}消息。我会结合当前群组上下文继续处理并同步后续情况。`;
-  }
-  return "";
-}
-
-async function dispatchReply(adapter, state, event, message, category, decision, signals, obligationDecision) {
-  if (decision.action === "observe_only") {
-    return {
-      ignored: false,
-      observed: true,
-      category,
-      obligation: obligationDecision,
-      signals,
-      decision,
-    };
-  }
-
-  const incomingMessage = {
-    id: message.id,
-    group_id: message.group_id,
-    thread_id: message.thread_id,
-    parent_message_id: message.parent_message_id,
-    agent_id: message.author_agent_id,
-    agent_name: null,
-    source_agent_name: null,
-  };
-
-  let replyText = "";
-  if (typeof adapter.generateReply === "function") {
-    try {
-      replyText = await adapter.generateReply(
-        {
-          id: message.id,
-          group_id: message.group_id,
-          flow_type: message.flow_type,
-          message_type: message.message_type,
-          content: { text: message.text, payload: message.payload },
-          relations: { thread_id: message.thread_id, parent_message_id: message.parent_message_id },
-          routing: { target: { agent_id: message.target_agent_id }, mentions: message.mentions },
-          extensions: message.extensions,
-        },
-        state,
-        {},
-        { responseDecision: decision, contextFlags: signals, mode: category },
-      );
-    } catch {
-      replyText = "";
-    }
-  }
-
-  if (!textOf(replyText)) {
-    replyText = fallbackReplyText(message, category, decision);
-  }
-
-  if (!textOf(replyText)) {
-    return {
-      ignored: false,
-      observed: true,
-      category,
-      obligation: obligationDecision,
-      signals,
-      decision,
-    };
-  }
-
-  const outbound = {
-    group_id: message.group_id,
-    flow_type: "run",
-    message_type: decision.action === "ack" ? "summary" : "analysis",
-    content: {
-      text: replyText,
-      payload: {},
-    },
-    relations: {
-      thread_id: message.thread_id || message.id || null,
-      parent_message_id: message.id || null,
-    },
-    routing: {
-      target: {
-        agent_id: message.author_agent_id,
-      },
-      mentions: [],
-    },
-    extensions: {
-      custom: {
-        responsibility_reason: obligationDecision.reason,
-      },
-    },
-  };
-
-  const result = await adapter.postCommunityMessage(state, incomingMessage, outbound);
+function judgmentResult(category, message, signals, obligationDecision, recommendation, extras = {}) {
   return {
-    posted: true,
     category,
-    obligation: obligationDecision,
+    message,
     signals,
-    decision,
-    result,
+    obligation: obligationDecision,
+    recommendation,
+    observed: recommendation.mode === "observe_only",
+    ...extras,
   };
 }
 
@@ -265,25 +164,22 @@ export async function handleRuntimeEvent(adapter, state, event) {
   const payload = extractPayload(event);
   const message = normalizeMessage(payload);
   const classification = classifyInput(eventType, message);
+  const signals = responsibilitySignals(message, state);
+  const obligationDecision = decideObligation(classification.category, signals);
+  const recommendation = recommendHandling(classification.category, obligationDecision.obligation, signals);
 
   if (classification.category === "protocol_violation") {
     if (typeof adapter.handleProtocolViolation === "function") {
       await adapter.handleProtocolViolation(state, payload);
     }
-    const signals = responsibilitySignals(message, state);
-    const obligationDecision = decideObligation(classification.category, signals);
-    const decision = defaultResponseDecision(classification.category, obligationDecision.obligation, signals);
-    return dispatchReply(adapter, state, event, message, classification.category, decision, signals, obligationDecision);
+    return judgmentResult(classification.category, message, signals, obligationDecision, recommendation);
   }
 
   if (classification.category === "workflow_contract") {
     if (typeof adapter.loadWorkflowContract === "function" && message.group_id) {
-      await adapter.loadWorkflowContract(state, message.group_id, payload);
+      await adapter.loadWorkflowContract(message.group_id, payload, "event");
     }
-    const signals = responsibilitySignals(message, state);
-    const obligationDecision = decideObligation(classification.category, signals);
-    const decision = defaultResponseDecision(classification.category, obligationDecision.obligation, signals);
-    return dispatchReply(adapter, state, event, message, classification.category, decision, signals, obligationDecision);
+    return judgmentResult(classification.category, message, signals, obligationDecision, recommendation);
   }
 
   if (classification.category === "group_context") {
@@ -292,14 +188,8 @@ export async function handleRuntimeEvent(adapter, state, event) {
     } else if (typeof adapter.loadChannelContext === "function" && message.group_id) {
       await adapter.loadChannelContext(state, message.group_id, payload);
     }
-    const signals = responsibilitySignals(message, state);
-    const obligationDecision = decideObligation(classification.category, signals);
-    const decision = defaultResponseDecision(classification.category, obligationDecision.obligation, signals);
-    return dispatchReply(adapter, state, event, message, classification.category, decision, signals, obligationDecision);
+    return judgmentResult(classification.category, message, signals, obligationDecision, recommendation);
   }
 
-  const signals = responsibilitySignals(message, state);
-  const obligationDecision = decideObligation(classification.category, signals);
-  const decision = defaultResponseDecision(classification.category, obligationDecision.obligation, signals);
-  return dispatchReply(adapter, state, event, message, classification.category, decision, signals, obligationDecision);
+  return judgmentResult(classification.category, message, signals, obligationDecision, recommendation);
 }

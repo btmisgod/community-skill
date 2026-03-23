@@ -18,12 +18,6 @@ const state = {
 
 function baseAdapter() {
   return {
-    async fetchRuntimeContext() {
-      return { group_roles: [{ agent: "agent-self", role: "builder" }] };
-    },
-    async postCommunityMessage() {
-      return { id: "reply-1" };
-    },
     async loadWorkflowContract() {
       return { ok: true };
     },
@@ -32,12 +26,6 @@ function baseAdapter() {
     },
     async handleProtocolViolation() {
       return { ok: true };
-    },
-    async generateReply() {
-      return "generated reply";
-    },
-    buildFallbackReplyText() {
-      return "fallback reply";
     },
   };
 }
@@ -50,7 +38,7 @@ function eventFor(message, eventType = "message.posted") {
   };
 }
 
-test("targeted run message becomes required", async () => {
+test("targeted run message becomes required judgment", async () => {
   const result = await runtime.handleRuntimeEvent(baseAdapter(), state, eventFor({
     id: "msg-1",
     group_id: "group-1",
@@ -66,7 +54,8 @@ test("targeted run message becomes required", async () => {
   assert.equal(result.category, "run");
   assert.equal(result.obligation.obligation, "required");
   assert.equal(result.signals.targeted, true);
-  assert.equal(result.posted, true);
+  assert.equal(result.recommendation.mode, "needs_agent_judgment");
+  assert.equal(result.posted, undefined);
 });
 
 test("visible non-targeted collaboration remains optional", async () => {
@@ -85,9 +74,10 @@ test("visible non-targeted collaboration remains optional", async () => {
   assert.equal(result.category, "start");
   assert.equal(result.obligation.obligation, "optional");
   assert.equal(result.signals.targeted, false);
+  assert.equal(result.recommendation.mode, "agent_discretion");
 });
 
-test("non-targeted collaboration question is still observed only", async () => {
+test("non-targeted collaboration question stays optional judgment", async () => {
   const result = await runtime.handleRuntimeEvent(baseAdapter(), state, eventFor({
     id: "msg-2b",
     group_id: "group-1",
@@ -102,7 +92,7 @@ test("non-targeted collaboration question is still observed only", async () => {
 
   assert.equal(result.category, "run");
   assert.equal(result.obligation.obligation, "optional");
-  assert.equal(result.decision.action, "observe_only");
+  assert.equal(result.recommendation.mode, "agent_discretion");
   assert.equal(result.posted, undefined);
 });
 
@@ -122,6 +112,7 @@ test("status is treated as community facility semantics", async () => {
   assert.equal(result.category, "status");
   assert.equal(result.obligation.obligation, "observe_only");
   assert.equal(result.signals.status, true);
+  assert.equal(result.recommendation.mode, "observe_only");
 });
 
 test("group context update is observed without forced ack", async () => {
@@ -133,6 +124,7 @@ test("group context update is observed without forced ack", async () => {
 
   assert.equal(result.category, "group_context");
   assert.equal(result.obligation.obligation, "observe_only");
+  assert.equal(result.recommendation.mode, "observe_only");
 });
 
 test("self message is observed only", async () => {

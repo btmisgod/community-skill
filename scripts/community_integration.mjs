@@ -1268,6 +1268,128 @@ export async function sendCommunityMessage(state, incomingMessage, payload) {
   return result;
 }
 
+function canonicalMessageForExecution(runtimeMessage) {
+  return {
+    id: runtimeMessage?.id || null,
+    group_id: runtimeMessage?.group_id || null,
+    flow_type: runtimeMessage?.flow_type || "run",
+    message_type: runtimeMessage?.message_type || "analysis",
+    content: {
+      text: runtimeMessage?.text || "",
+      payload: runtimeMessage?.payload || {},
+    },
+    relations: {
+      thread_id: runtimeMessage?.thread_id || null,
+      parent_message_id: runtimeMessage?.parent_message_id || null,
+    },
+    routing: {
+      target: {
+        agent_id: runtimeMessage?.target_agent_id || null,
+      },
+      mentions: Array.isArray(runtimeMessage?.mentions) ? runtimeMessage.mentions : [],
+    },
+    extensions: runtimeMessage?.extensions || {},
+  };
+}
+
+function incomingMessageForRuntime(runtimeMessage) {
+  return {
+    id: runtimeMessage?.id || null,
+    group_id: runtimeMessage?.group_id || null,
+    thread_id: runtimeMessage?.thread_id || null,
+    parent_message_id: runtimeMessage?.parent_message_id || null,
+    agent_id: runtimeMessage?.author_agent_id || null,
+    agent_name: null,
+    source_agent_name: null,
+  };
+}
+
+async function executeRuntimeJudgment(state, judgment) {
+  const obligation = String(judgment?.obligation?.obligation || "observe_only").trim().toLowerCase();
+  const category = String(judgment?.category || "unknown").trim();
+  const signals = judgment?.signals || {};
+  const runtimeMessage = judgment?.message || {};
+  const responseDecision = decideCommunityResponse(obligation, category, { contextFlags: signals });
+
+  if (["observe_only", "ignore", "no_action"].includes(String(responseDecision?.action || "").trim().toLowerCase())) {
+    return {
+      ...judgment,
+      decision: responseDecision,
+      observed: true,
+      no_action: true,
+    };
+  }
+
+  const executionMessage = canonicalMessageForExecution(runtimeMessage);
+  let runtimeContext = {};
+  if (runtimeMessage?.group_id) {
+    try {
+      runtimeContext = await fetchRuntimeContext(runtimeMessage.group_id, state);
+    } catch {
+      runtimeContext = {};
+    }
+  }
+
+  let replyText = "";
+  try {
+    replyText = await executeTask(executionMessage, state, runtimeContext);
+  } catch {
+    replyText = "";
+  }
+
+  if (!String(replyText || "").trim()) {
+    replyText = buildFallbackReplyText(executionMessage, state, runtimeContext, {
+      responseDecision,
+      contextFlags: signals,
+      mode: category,
+      category,
+    });
+  }
+
+  if (!String(replyText || "").trim()) {
+    return {
+      ...judgment,
+      decision: responseDecision,
+      observed: true,
+      no_action: true,
+    };
+  }
+
+  const result = await sendCommunityMessage(state, incomingMessageForRuntime(runtimeMessage), {
+    action: responseDecision.action,
+    responseDecision,
+    group_id: runtimeMessage.group_id,
+    flow_type: "run",
+    message_type: responseDecision.action === "ack" ? "summary" : "analysis",
+    content: {
+      text: replyText,
+      payload: {},
+    },
+    relations: {
+      thread_id: runtimeMessage.thread_id || runtimeMessage.id || null,
+      parent_message_id: runtimeMessage.id || null,
+    },
+    routing: {
+      target: {
+        agent_id: runtimeMessage.author_agent_id || null,
+      },
+      mentions: [],
+    },
+    extensions: {
+      custom: {
+        responsibility_reason: judgment?.obligation?.reason || null,
+      },
+    },
+  });
+
+  return {
+    ...judgment,
+    decision: responseDecision,
+    posted: true,
+    result,
+  };
+}
+
 function parseActiveSendPayload(raw) {
   const payload = raw && typeof raw === "object" ? raw : {};
   const content = payload.content && typeof payload.content === "object" ? { ...payload.content } : {};
@@ -1317,22 +1439,17 @@ export async function receiveCommunityEvent(state, event) {
   }
 
   const runtimeModule = await loadRuntimeModule();
-  return runtimeModule.handleRuntimeEvent(
+  const judgment = await runtimeModule.handleRuntimeEvent(
     {
-      fetchRuntimeContext,
-      executeTask,
-      postCommunityMessage: sendCommunityMessage,
       handleProtocolViolation,
       loadWorkflowContract,
       loadGroupContext,
       loadChannelContext: loadGroupContext,
-      decideResponse: decideCommunityResponse,
-      generateReply: generateCommunityReply,
-      buildFallbackReplyText,
     },
     state,
     event,
   );
+  return executeRuntimeJudgment(state, judgment);
 }
 
 async function bootstrapState() {

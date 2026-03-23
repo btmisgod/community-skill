@@ -13,9 +13,11 @@ process.env.COMMUNITY_BASE_URL = "http://community.example/api/v1";
 process.env.COMMUNITY_GROUP_SLUG = "public-lobby";
 process.env.MESSAGE_PROTOCOL_V2 = "1";
 process.env.WEBHOOK_RECEIPT_V2 = "1";
+process.env.MODEL_BASE_URL = "http://model.example/v1";
+process.env.MODEL_API_KEY = "test-key";
+process.env.MODEL_ID = "test-model";
 
 const integration = await import(pathToFileURL(path.join(process.cwd(), "community-skill", "scripts", "community_integration.mjs")).href + `?t=${Date.now()}`);
-const runtime = await import(pathToFileURL(path.join(process.cwd(), "community-skill", "assets", "community-runtime-v0.mjs")).href + `?t=${Date.now()}`);
 
 const state = {
   token: "agent-token",
@@ -23,6 +25,7 @@ const state = {
   agentName: "Agent Self",
   groupId: "group-1",
   profile: { display_name: "Agent Self", handle: "agent-self" },
+  profileFingerprint: "stable",
 };
 
 test.after(() => {
@@ -107,68 +110,139 @@ test("sendCommunityMessage posts current canonical body to /messages", async () 
   }
 });
 
-test("runtime accepts canonical run message and replies when explicitly targeted", async () => {
-  const outbound = integration.buildCommunityMessage(
-    state,
-    {
-      group_id: "group-1",
-      thread_id: "thread-1",
-      parent_message_id: null,
-      target_agent_id: "agent-self",
-      target_agent: "Agent Self",
-    },
-    {
-      flow_type: "run",
-      message_type: "analysis",
-      content: {
-        text: "Please review this and reply.",
-        metadata: { intent: "request_action" },
+test("receiveCommunityEvent executes required judgment and posts reply", async () => {
+  const sent = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options = {}) => {
+    if (String(url).includes("/groups/group-1/protocol")) {
+      return {
+        ok: true,
+        async text() {
+          return JSON.stringify({ success: true, data: { protocol: { version: "v1" }, applicable_rule_ids: [] } });
+        },
+      };
+    }
+    if (String(url).includes("/groups/group-1/context")) {
+      return {
+        ok: true,
+        async text() {
+          return JSON.stringify({ success: true, data: { group_slug: "public-lobby", summary: "context" } });
+        },
+      };
+    }
+    if (String(url).includes("/chat/completions")) {
+      return {
+        ok: true,
+        async json() {
+          return { choices: [{ message: { content: "generated reply" } }] };
+        },
+      };
+    }
+    if (String(url).includes("/messages")) {
+      sent.push(JSON.parse(options.body));
+      return {
+        ok: true,
+        async text() {
+          return JSON.stringify({ success: true, data: { id: "reply-1", group_id: "group-1" } });
+        },
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+
+  try {
+    const result = await integration.receiveCommunityEvent(state, {
+      event: {
+        event_type: "message.posted",
+        payload: {
+          message: {
+            id: "msg-in-1",
+            group_id: "group-1",
+            author: { agent_id: "agent-other" },
+            flow_type: "run",
+            message_type: "analysis",
+            content: { text: "Please review this and reply." },
+            relations: { thread_id: "thread-1", parent_message_id: null },
+            routing: { target: { agent_id: "agent-self" }, mentions: [] },
+            extensions: {},
+          },
+        },
       },
-    },
-  );
+      entity: {
+        message: {
+          id: "msg-in-1",
+          group_id: "group-1",
+          author: { agent_id: "agent-other" },
+          flow_type: "run",
+          message_type: "analysis",
+          content: { text: "Please review this and reply." },
+          relations: { thread_id: "thread-1", parent_message_id: null },
+          routing: { target: { agent_id: "agent-self" }, mentions: [] },
+          extensions: {},
+        },
+      },
+      group_id: "group-1",
+    });
 
-  const adapter = {
-    async fetchRuntimeContext() {
-      return { group_roles: [{ agent: "agent-self", role: "builder" }] };
-    },
-    async postCommunityMessage() {
-      return { id: "reply-1" };
-    },
-    async generateReply() {
-      return "generated reply";
-    },
-    buildFallbackReplyText() {
-      return "fallback";
-    },
-    async handleProtocolViolation() {
-      return { ok: true };
-    },
-    async loadWorkflowContract() {
-      return { ok: true };
-    },
-    async loadGroupContext() {
-      return { ok: true };
-    },
+    assert.equal(result.category, "run");
+    assert.equal(result.obligation.obligation, "required");
+    assert.equal(result.decision.action, "full_reply");
+    assert.equal(result.posted, true);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].routing.target.agent_id, "agent-other");
+    assert.equal(sent[0].relations.parent_message_id, "msg-in-1");
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("non-targeted collaboration remains observed only at integration layer", async () => {
+  const originalFetch = global.fetch;
+  global.fetch = async () => {
+    throw new Error("fetch should not be called for optional observed message");
   };
 
-  const projected = {
-    ...outbound,
-    author: {
-      ...(outbound.author || {}),
-      agent_id: "agent-other",
-    },
-  };
+  try {
+    const result = await integration.receiveCommunityEvent(state, {
+      event: {
+        event_type: "message.posted",
+        payload: {
+          message: {
+            id: "msg-in-2",
+            group_id: "group-1",
+            author: { agent_id: "agent-other" },
+            flow_type: "run",
+            message_type: "analysis",
+            content: { text: "General collaboration update." },
+            relations: { thread_id: "thread-1", parent_message_id: null },
+            routing: { target: null, mentions: [] },
+            extensions: {},
+          },
+        },
+      },
+      entity: {
+        message: {
+          id: "msg-in-2",
+          group_id: "group-1",
+          author: { agent_id: "agent-other" },
+          flow_type: "run",
+          message_type: "analysis",
+          content: { text: "General collaboration update." },
+          relations: { thread_id: "thread-1", parent_message_id: null },
+          routing: { target: null, mentions: [] },
+          extensions: {},
+        },
+      },
+      group_id: "group-1",
+    });
 
-  const result = await runtime.handleRuntimeEvent(adapter, state, {
-    event: { event_type: "message.posted", payload: { message: projected } },
-    entity: { message: projected },
-    group_id: "group-1",
-  });
-
-  assert.equal(result.category, "run");
-  assert.equal(result.obligation.obligation, "required");
-  assert.equal(result.signals.targeted, true);
-  assert.equal(result.posted, true);
+    assert.equal(result.category, "run");
+    assert.equal(result.obligation.obligation, "optional");
+    assert.equal(result.decision.action, "observe_only");
+    assert.equal(result.posted, undefined);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 
 test("receiveCommunityEvent keeps receipt/debug events outside normal intake", async () => {

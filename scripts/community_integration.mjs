@@ -41,7 +41,7 @@ const WEBHOOK_PATH = process.env.COMMUNITY_WEBHOOK_PATH || `/webhook/${AGENT_SLU
 const SEND_PATH = process.env.COMMUNITY_SEND_PATH || `/send/${AGENT_SLUG}`;
 const AGENT_SOCKET_PATH =
   process.env.COMMUNITY_AGENT_SOCKET_PATH || shortSocketPath(INGRESS_HOME, AGENT_SLUG);
-const WEBHOOK_PUBLIC_HOST = process.env.COMMUNITY_WEBHOOK_PUBLIC_HOST || "127.0.0.1";
+const WEBHOOK_PUBLIC_HOST = process.env.COMMUNITY_WEBHOOK_PUBLIC_HOST || "";
 const WEBHOOK_PUBLIC_URL = process.env.COMMUNITY_WEBHOOK_PUBLIC_URL || "";
 const ALLOW_PRIVATE_WEBHOOK_URL = process.env.COMMUNITY_WEBHOOK_ALLOW_PRIVATE === "1";
 const WEBHOOK_IP_DISCOVERY_URLS = String(process.env.COMMUNITY_WEBHOOK_IP_DISCOVERY_URLS || "https://api.ipify.org,https://ifconfig.me/ip,https://api.ip.sb/ip").split(",").map((item) => item.trim()).filter(Boolean);
@@ -472,11 +472,15 @@ export function saveCommunityState(state) {
   return state || {};
 }
 
-function buildWebhookUrl() {
+function buildWebhookUrl(hostname = "") {
+  const host = String(hostname || "").trim();
   if (WEBHOOK_PUBLIC_URL.trim()) {
     return WEBHOOK_PUBLIC_URL.trim();
   }
-  return `http://${WEBHOOK_PUBLIC_HOST}:${LISTEN_PORT}${WEBHOOK_PATH}`;
+  if (!host) {
+    return "";
+  }
+  return `http://${host}:${LISTEN_PORT}${WEBHOOK_PATH}`;
 }
 
 function isPublicIpv4Host(hostname) {
@@ -505,14 +509,17 @@ async function resolveWebhookUrl() {
   if (WEBHOOK_PUBLIC_URL.trim()) {
     return WEBHOOK_PUBLIC_URL.trim();
   }
-  if (isPublicIpv4Host(WEBHOOK_PUBLIC_HOST)) {
-    return `http://${WEBHOOK_PUBLIC_HOST}:${LISTEN_PORT}${WEBHOOK_PATH}`;
+  const configuredHost = String(WEBHOOK_PUBLIC_HOST || "").trim();
+  if (isPublicIpv4Host(configuredHost)) {
+    return buildWebhookUrl(configuredHost);
   }
   const detectedIp = await detectPublicIpv4();
   if (detectedIp) {
-    return `http://${detectedIp}:${LISTEN_PORT}${WEBHOOK_PATH}`;
+    return buildWebhookUrl(detectedIp);
   }
-  return buildWebhookUrl();
+  throw new Error(
+    "unable to determine a publicly reachable webhook address automatically; set COMMUNITY_WEBHOOK_PUBLIC_URL or COMMUNITY_WEBHOOK_PUBLIC_HOST explicitly",
+  );
 }
 
 function isPrivateIpv4Host(hostname) {
@@ -1672,7 +1679,7 @@ export async function startCommunityIntegration() {
           listening: true,
           agentName: currentState?.agentName || AGENT_NAME,
           groupSlug: currentState?.groupSlug || GROUP_SLUG,
-          webhookUrl: currentState?.webhookUrl || buildWebhookUrl(),
+          webhookUrl: currentState?.webhookUrl || null,
           webhookPath: WEBHOOK_PATH,
           sendPath: SEND_PATH,
           skill: "CommunityIntegrationSkill",

@@ -60,6 +60,15 @@ const BUNDLED_RUNTIME_PATH = path.join(SKILL_HOME, "assets", "community-runtime-
 const WORKSPACE_RUNTIME_PATH = path.join(WORKSPACE, "scripts", "community-runtime-v0.mjs");
 const BUNDLED_AGENT_PROTOCOL_PATH = path.join(SKILL_HOME, "assets", "AGENT_PROTOCOL.md");
 const INSTALLED_AGENT_PROTOCOL_PATH = path.join(ASSETS_DIR, "AGENT_PROTOCOL.md");
+const WORKSPACE_ASSETS_DIR = path.join(WORKSPACE, "assets");
+
+function preferredAssetPath(name) {
+  const workspaceAsset = path.join(WORKSPACE_ASSETS_DIR, name);
+  if (fs.existsSync(workspaceAsset)) {
+    return workspaceAsset;
+  }
+  return path.join(ASSETS_DIR, name);
+}
 let runtimeModulePromise = null;
 
 function ensureDir(filePath) {
@@ -403,8 +412,8 @@ function profileFingerprint(profile) {
 }
 
 function buildProfile() {
-  const identityDoc = loadText(path.join(ASSETS_DIR, "IDENTITY.md"));
-  const soulDoc = loadText(path.join(ASSETS_DIR, "SOUL.md"));
+  const identityDoc = loadText(preferredAssetPath("IDENTITY.md"));
+  const soulDoc = loadText(preferredAssetPath("SOUL.md"));
   const displayName = firstNonEmpty(process.env.COMMUNITY_AGENT_DISPLAY_NAME, AGENT_NAME);
   const handle = slugifyHandle(firstNonEmpty(process.env.COMMUNITY_AGENT_HANDLE, displayName));
   const identity = firstNonEmpty(process.env.COMMUNITY_AGENT_IDENTITY, "OpenClaw community agent");
@@ -861,9 +870,9 @@ function channelContextInstructions(groupId) {
 }
 
 function buildExecutionPrompt(message, state, runtimeContext) {
-  const identity = loadText(path.join(ASSETS_DIR, "IDENTITY.md"));
-  const soul = loadText(path.join(ASSETS_DIR, "SOUL.md"));
-  const user = loadText(path.join(ASSETS_DIR, "USER.md"));
+  const identity = loadText(preferredAssetPath("IDENTITY.md"));
+  const soul = loadText(preferredAssetPath("SOUL.md"));
+  const user = loadText(preferredAssetPath("USER.md"));
   const agentProtocol = installedAgentProtocolText();
 
   return [

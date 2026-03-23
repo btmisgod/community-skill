@@ -308,6 +308,14 @@ COMMUNITY_WEBHOOK_PORT=${WEBHOOK_PORT}
 COMMUNITY_WEBHOOK_PUBLIC_HOST=${WEBHOOK_PUBLIC_HOST}
 EOF
 
+for asset_name in IDENTITY SOUL USER; do
+  workspace_asset="${WORKSPACE_ROOT}/assets/${asset_name}.md"
+  template_asset="${ASSETS_DIR}/${asset_name}.md"
+  if [[ -f "${workspace_asset}" ]]; then
+    cp "${workspace_asset}" "${template_asset}"
+  fi
+done
+
 if [[ ! -f "${ASSETS_DIR}/IDENTITY.md" ]]; then
   cat >"${ASSETS_DIR}/IDENTITY.md" <<'EOF'
 You are an OpenClaw community-connected agent.

@@ -383,13 +383,32 @@ function firstNonEmpty(...values) {
   return "";
 }
 
+function stableValue(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => stableValue(item));
+  }
+  if (value && typeof value === "object") {
+    return Object.keys(value)
+      .sort()
+      .reduce((acc, key) => {
+        acc[key] = stableValue(value[key]);
+        return acc;
+      }, {});
+  }
+  return value;
+}
+
+function profileFingerprint(profile) {
+  return crypto.createHash("sha256").update(JSON.stringify(stableValue(profile || {}))).digest("hex");
+}
+
 function buildProfile() {
   const identityDoc = loadText(path.join(ASSETS_DIR, "IDENTITY.md"));
   const soulDoc = loadText(path.join(ASSETS_DIR, "SOUL.md"));
   const displayName = firstNonEmpty(process.env.COMMUNITY_AGENT_DISPLAY_NAME, AGENT_NAME);
   const handle = slugifyHandle(firstNonEmpty(process.env.COMMUNITY_AGENT_HANDLE, displayName));
-  const identity = firstNonEmpty(process.env.COMMUNITY_AGENT_IDENTITY, "OpenClaw 閸楀繋缍?Agent");
-  const tagline = firstNonEmpty(process.env.COMMUNITY_AGENT_TAGLINE, AGENT_DESCRIPTION, "瀹稿弶甯撮崗銉с仦閸栧搫宕楁担婊勨偓鑽ゅ殠");
+  const identity = firstNonEmpty(process.env.COMMUNITY_AGENT_IDENTITY, "OpenClaw community agent");
+  const tagline = firstNonEmpty(process.env.COMMUNITY_AGENT_TAGLINE, AGENT_DESCRIPTION, "Connected to the shared community ingress");
   const bio = firstNonEmpty(
     process.env.COMMUNITY_AGENT_BIO,
     identityDoc.slice(0, 280),
@@ -413,6 +432,24 @@ function buildProfile() {
     accent_color: accentColor || undefined,
     expertise,
     home_group_slug: GROUP_SLUG,
+  };
+}
+
+async function patchCommunityProfile(state, profile) {
+  const updated = await request("/agents/me/profile", {
+    method: "PATCH",
+    token: state.token,
+    body: JSON.stringify({ profile }),
+  });
+  return {
+    ...state,
+    profileCompleted: true,
+    profileStatus: "synced",
+    profileLastError: null,
+    profile,
+    profileFingerprint: profileFingerprint(profile),
+    agentId: updated.id,
+    agentName: updated.name,
   };
 }
 
@@ -568,20 +605,7 @@ async function ensureRegisteredAgent(state) {
 async function ensureProfile(state) {
   const profile = buildProfile();
   try {
-    const updated = await request("/agents/me/profile", {
-      method: "PATCH",
-      token: state.token,
-      body: JSON.stringify({ profile }),
-    });
-    return {
-      ...state,
-      profileCompleted: true,
-      profileStatus: "synced",
-      profileLastError: null,
-      profile,
-      agentId: updated.id,
-      agentName: updated.name,
-    };
+    return await patchCommunityProfile(state, profile);
   } catch (error) {
     console.error(
       JSON.stringify(
@@ -614,12 +638,46 @@ export async function updateCommunityProfile(state, profileOverrides = null) {
           ...profileOverrides,
         }
       : baseProfile;
-  const updated = await request("/agents/me/profile", {
-    method: "PATCH",
-    token: state.token,
-    body: JSON.stringify({ profile }),
-  });
-  return { ...state, profileCompleted: true, profile, agentId: updated.id, agentName: updated.name };
+  return patchCommunityProfile(state, profile);
+}
+
+async function ensureProfileFresh(state, stage = "runtime_profile_check") {
+  const profile = buildProfile();
+  const nextFingerprint = profileFingerprint(profile);
+  const currentFingerprint =
+    String(state?.profileFingerprint || "").trim() || profileFingerprint(state?.profile || {});
+
+  if (currentFingerprint === nextFingerprint) {
+    return state;
+  }
+
+  console.log(
+    JSON.stringify(
+      {
+        ok: true,
+        community_profile: "drift_detected",
+        stage,
+        agentId: state?.agentId || null,
+      },
+      null,
+      2,
+    ),
+  );
+
+  try {
+    const nextState = await patchCommunityProfile(state, profile);
+    persistCommunityState(nextState, stage);
+    return nextState;
+  } catch (error) {
+    const failedState = {
+      ...state,
+      profileCompleted: false,
+      profileStatus: "failed",
+      profileLastError: error?.message || String(error),
+    };
+    persistCommunityState(failedState, `${stage}_failed`);
+    return failedState;
+  }
 }
 
 async function ensureGroupMembership(state) {
@@ -1220,6 +1278,7 @@ function parseActiveSendPayload(raw) {
 }
 
 async function handleActiveSend(state, payload) {
+  state = await ensureProfileFresh(state, "active_send_profile_sync");
   const normalized = parseActiveSendPayload(payload);
   if (!normalized.group_id) {
     throw new Error("community-send requires group_id");
@@ -1239,6 +1298,7 @@ async function loadRuntimeModule() {
 }
 
 export async function receiveCommunityEvent(state, event) {
+  state = await ensureProfileFresh(state, "webhook_profile_sync");
   const eventType = String(event?.event?.event_type || "").trim();
   if (isOutboundReceiptEventType(eventType)) {
     return handleOutboundReceiptEvent(state, event);

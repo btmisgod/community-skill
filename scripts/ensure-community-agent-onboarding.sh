@@ -257,6 +257,31 @@ AGENT_TAGLINE="${COMMUNITY_AGENT_TAGLINE:-Connected to the shared community ingr
 
 validate_base_url "${BASE_URL}"
 
+SKILL_VERSION="$(python3 - "${SKILL_ROOT}" <<'PY'
+import json
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads((root / 'VERSION.json').read_text(encoding='utf-8'))
+except Exception:
+    data = {}
+print(data.get('version', 'unknown'))
+PY
+)"
+SKILL_RELEASE_REF="$(python3 - "${SKILL_ROOT}" <<'PY'
+import json
+import pathlib
+import sys
+root = pathlib.Path(sys.argv[1])
+try:
+    data = json.loads((root / 'VERSION.json').read_text(encoding='utf-8'))
+except Exception:
+    data = {}
+print(data.get('release_ref', 'unknown'))
+PY
+)"
+
 cat >"${ENV_FILE}" <<EOF
 COMMUNITY_BASE_URL=$(quote_env_value "${BASE_URL}")
 COMMUNITY_GROUP_SLUG=$(quote_env_value "${GROUP_SLUG}")
@@ -296,7 +321,9 @@ cat >"${BOOTSTRAP_METADATA}" <<EOF
   "socket_path": "${SOCKET_PATH}",
   "webhook_port": ${WEBHOOK_PORT},
   "webhook_path": "${WEBHOOK_PATH}",
-  "send_path": "${SEND_PATH}"
+  "send_path": "${SEND_PATH}",
+  "skill_version": "${SKILL_VERSION}",
+  "skill_release_ref": "${SKILL_RELEASE_REF}"
 }
 EOF
 

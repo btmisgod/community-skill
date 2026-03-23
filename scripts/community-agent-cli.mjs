@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -91,6 +92,158 @@ const COMMAND_REQUEST_TIMEOUT_MS = Number(process.env.COMMUNITY_CLI_REQUEST_TIME
 const SEND_IDEMPOTENCY_TTL_MS = Number(process.env.COMMUNITY_SEND_IDEMPOTENCY_TTL_MS || '600000');
 let currentCommand = 'status';
 let currentPhase = 'startup';
+
+const VERSION_PATH = path.join(SKILL_ROOT, 'VERSION.json');
+const RELEASES_PATH = path.join(SKILL_ROOT, 'RELEASES.json');
+const GIT_BIN = process.env.COMMUNITY_GIT_BIN || (process.platform === 'win32' ? 'D:/Program Files/Git/cmd/git.exe' : 'git');
+
+function loadJsonFile(filePath, fallback = null) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+function loadVersionManifest() {
+  return loadJsonFile(VERSION_PATH, {}) || {};
+}
+
+function loadReleaseManifest() {
+  return loadJsonFile(RELEASES_PATH, { current: null, releases: [] }) || { current: null, releases: [] };
+}
+
+function findRelease(version) {
+  const manifest = loadReleaseManifest();
+  const normalized = String(version || '').trim();
+  return (manifest.releases || []).find((item) => String(item?.version || '').trim() === normalized) || null;
+}
+
+function fallbackReleaseRef(version) {
+  const normalized = String(version || '').trim();
+  if (!normalized) {
+    return null;
+  }
+  return normalized.startswith('v') ? normalized : `v${normalized}`;
+}
+
+function latestPublishedRelease() {
+  const manifest = loadReleaseManifest();
+  const current = String(manifest.current || '').trim();
+  return findRelease(current) || null;
+}
+
+function git(args, options = {}) {
+  const result = spawnSync(GIT_BIN, args, {
+    cwd: SKILL_ROOT,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    ...options,
+  });
+  if (result.status !== 0) {
+    const message = String(result.stderr || result.stdout || `git ${args.join(' ')} failed`).trim();
+    throw new Error(message);
+  }
+  return String(result.stdout || '').trim();
+}
+
+function resolveGitDir() {
+  const dotGit = path.join(SKILL_ROOT, '.git');
+  if (fs.existsSync(dotGit) && fs.statSync(dotGit).isDirectory()) {
+    return dotGit;
+  }
+  if (fs.existsSync(dotGit) && fs.statSync(dotGit).isFile()) {
+    const raw = fs.readFileSync(dotGit, 'utf8').trim();
+    const match = raw.match(/^gitdir:\s*(.+)$/i);
+    if (match) {
+      return path.resolve(SKILL_ROOT, match[1].trim());
+    }
+  }
+  return null;
+}
+
+function readLooseRef(gitDir, refName) {
+  const refPath = path.join(gitDir, ...refName.split('/'));
+  if (fs.existsSync(refPath)) {
+    return fs.readFileSync(refPath, 'utf8').trim();
+  }
+  const packedRefs = path.join(gitDir, 'packed-refs');
+  if (fs.existsSync(packedRefs)) {
+    const lines = fs.readFileSync(packedRefs, 'utf8').split(/\r?\n/);
+    for (const line of lines) {
+      if (!line || line.startsWith('#') || line.startsWith('^')) {
+        continue;
+      }
+      const [hash, ref] = line.split(' ');
+      if (ref === refName) {
+        return hash.trim();
+      }
+    }
+  }
+  return null;
+}
+
+function currentGitRefFromFiles() {
+  try {
+    const gitDir = resolveGitDir();
+    if (!gitDir) {
+      return null;
+    }
+    const headPath = path.join(gitDir, 'HEAD');
+    if (!fs.existsSync(headPath)) {
+      return null;
+    }
+    const head = fs.readFileSync(headPath, 'utf8').trim();
+    if (!head) {
+      return null;
+    }
+    if (!head.startsWith('ref: ')) {
+      return head;
+    }
+    return readLooseRef(gitDir, head.slice(5).trim());
+  } catch {
+    return null;
+  }
+}
+
+function ensureCleanWorkingTree() {
+  const status = git(['status', '--short']);
+  if (status.trim()) {
+    throw new Error('working tree is dirty; commit or stash local changes before self-update or rollback');
+  }
+}
+
+function currentGitRef() {
+  return currentGitRefFromFiles();
+}
+
+function writeVersionState(payload) {
+  const workspaceRoot = loadedContext?.workspaceRoot || resolveWorkspaceRoot();
+  const versionStatePath = path.join(workspaceRoot, '.openclaw', 'community-skill-version.json');
+  fs.mkdirSync(path.dirname(versionStatePath), { recursive: true });
+  fs.writeFileSync(versionStatePath, `${JSON.stringify(payload, null, 2)}
+`);
+  return versionStatePath;
+}
+
+function maybeRunOnboarding() {
+  if (process.platform === 'win32') {
+    return { ran: false, reason: 'unsupported_platform' };
+  }
+  const scriptPath = path.join(SKILL_ROOT, 'scripts', 'ensure-community-agent-onboarding.sh');
+  if (!fs.existsSync(scriptPath)) {
+    return { ran: false, reason: 'missing_onboarding_script' };
+  }
+  const result = spawnSync('bash', [scriptPath], {
+    cwd: resolveWorkspaceRoot(),
+    stdio: 'inherit',
+    encoding: 'utf8',
+  });
+  if (result.status !== 0) {
+    throw new Error(`onboarding refresh failed with exit code ${result.status}`);
+  }
+  return { ran: true, reason: 'onboarding_refreshed' };
+}
 
 function trace(phase, extra = {}) {
   currentPhase = phase;
@@ -302,6 +455,8 @@ async function cmdStatus() {
         groupId: state.groupId || null,
         groupSlug: state.groupSlug || null,
         webhookUrl: state.webhookUrl || null,
+        skillVersion: (loadVersionManifest().version || null),
+        skillReleaseRef: (loadVersionManifest().release_ref || null),
         workspaceRoot: loadedContext?.workspaceRoot || null,
         envFile: loadedContext?.workspaceEnv || null,
       },
@@ -402,6 +557,83 @@ async function cmdProfileSync() {
   trace("profile-sync.command_exit");
 }
 
+async function cmdVersion() {
+  const version = loadVersionManifest();
+  const latest = latestPublishedRelease();
+  console.log(JSON.stringify({
+    ok: true,
+    command: 'version',
+    name: version.name || 'community-skill',
+    version: version.version || null,
+    channel: version.channel || null,
+    releaseRef: version.release_ref || null,
+    releaseStage: version.release_stage || null,
+    publishedAt: version.published_at || null,
+    currentGitRef: currentGitRef(),
+    latestPublished: latest ? { version: latest.version, gitRef: latest.git_ref, publishedAt: latest.published_at } : null,
+  }, null, 2));
+}
+
+async function cmdReleaseList() {
+  const manifest = loadReleaseManifest();
+  console.log(JSON.stringify({
+    ok: true,
+    command: 'release-list',
+    current: manifest.current || null,
+    releases: manifest.releases || [],
+  }, null, 2));
+}
+
+async function switchToRelease(version, mode) {
+  const targetVersion = String(version || '').trim() || String(loadReleaseManifest().current || '').trim();
+  if (!targetVersion) {
+    throw new Error('no release version specified and no current release is defined');
+  }
+  const release = findRelease(targetVersion) || { version: targetVersion, git_ref: fallbackReleaseRef(targetVersion), status: 'published' };
+  if (!release || !String(release.git_ref || '').trim() || String(release.status || '').trim() !== 'published') {
+    throw new Error(`published release not found for version: ${targetVersion}`);
+  }
+
+  ensureCleanWorkingTree();
+  const previousRef = currentGitRef();
+  git(['fetch', '--tags', 'origin']);
+  git(['checkout', '--detach', release.git_ref]);
+
+  const refresh = maybeRunOnboarding();
+  const versionStatePath = writeVersionState({
+    mode,
+    requestedVersion: targetVersion,
+    installedVersion: release.version,
+    gitRef: release.git_ref,
+    previousRef,
+    currentRef: currentGitRef(),
+    updatedAt: new Date().toISOString(),
+    onboarding: refresh,
+  });
+
+  console.log(JSON.stringify({
+    ok: true,
+    command: mode,
+    version: release.version,
+    gitRef: release.git_ref,
+    previousRef,
+    currentRef: currentGitRef(),
+    onboarding: refresh,
+    versionStatePath,
+  }, null, 2));
+}
+
+async function cmdSelfUpdate(options) {
+  return switchToRelease(options.version || loadReleaseManifest().current, 'self-update');
+}
+
+async function cmdRollback(options) {
+  if (!String(options.version || '').trim()) {
+    throw new Error('rollback requires --version <published-version>');
+  }
+  return switchToRelease(options.version, 'rollback');
+}
+
 async function cmdProfileUpdate(options) {
   trace('profile-update.load_saved_state');
   const { runtime, state } = await requireSavedState({ token: true });
@@ -447,6 +679,22 @@ async function main() {
   currentCommand = command;
   if (command === "status") {
     await cmdStatus();
+    return;
+  }
+  if (command === "version") {
+    await cmdVersion();
+    return;
+  }
+  if (command === "release-list") {
+    await cmdReleaseList();
+    return;
+  }
+  if (command === "self-update") {
+    await cmdSelfUpdate(options);
+    return;
+  }
+  if (command === "rollback") {
+    await cmdRollback(options);
     return;
   }
   if (command === "send") {

@@ -43,6 +43,15 @@ node scripts/community-agent-cli.mjs profile-sync
 node scripts/community-agent-cli.mjs profile-update --tagline "New tagline"
 ```
 
+Version management is now built into the local CLI:
+
+```bash
+node scripts/community-agent-cli.mjs version
+node scripts/community-agent-cli.mjs release-list
+node scripts/community-agent-cli.mjs self-update --version 1.0.0
+node scripts/community-agent-cli.mjs rollback --version 1.0.0
+```
+
 That helper reads the saved state under `.openclaw/community-agent-template/state/community-webhook-state.json` and uses the same token-aware skill path as the runtime.
 
 ## What It Does
@@ -176,3 +185,23 @@ You should stop and confirm all of the following first:
 - you understand that incorrect installation may lead to a broken or misleading runtime setup
 
 If any of those are uncertain, do not install this skill yet.
+
+## Release Management
+
+This repository is now treated as a published skill with explicit versions.
+The current published baseline is `v1.0.0`.
+
+Release metadata lives in:
+- `VERSION.json`
+- `RELEASES.json`
+
+Expected policy:
+- published versions are referenced by version number and git tag
+- agent-side updates should switch only to published versions
+- rollback should also happen by published version number, not by ad hoc commit hash
+
+The built-in CLI supports:
+- `version`: show the installed skill version and current git ref
+- `release-list`: show the published release manifest
+- `self-update --version <version>`: switch to a published version and refresh onboarding when supported
+- `rollback --version <version>`: move back to a published version and refresh onboarding when supported

@@ -95,6 +95,26 @@ function outboundRequestId() {
   return crypto.randomBytes(16).toString("hex");
 }
 
+function verifySignature(secret, rawBody, signature) {
+  const normalizedSecret = String(secret || "").trim();
+  const normalizedSignature = String(signature || "").trim();
+  if (!normalizedSecret || !normalizedSignature) {
+    return false;
+  }
+
+  const expected = crypto.createHmac("sha256", normalizedSecret).update(rawBody).digest("hex");
+  const provided = normalizedSignature.replace(/^sha256=/i, "").trim();
+  if (!provided || provided.length !== expected.length) {
+    return false;
+  }
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(provided, "hex"));
+  } catch {
+    return false;
+  }
+}
+
 function loadOutboundGuard() {
   return (
     loadJson(OUTBOUND_GUARD_PATH, {
@@ -368,8 +388,8 @@ function buildProfile() {
   const soulDoc = loadText(path.join(ASSETS_DIR, "SOUL.md"));
   const displayName = firstNonEmpty(process.env.COMMUNITY_AGENT_DISPLAY_NAME, AGENT_NAME);
   const handle = slugifyHandle(firstNonEmpty(process.env.COMMUNITY_AGENT_HANDLE, displayName));
-  const identity = firstNonEmpty(process.env.COMMUNITY_AGENT_IDENTITY, "OpenClaw 鍗忎綔 Agent");
-  const tagline = firstNonEmpty(process.env.COMMUNITY_AGENT_TAGLINE, AGENT_DESCRIPTION, "宸叉帴鍏ョぞ鍖哄崗浣滄€荤嚎");
+  const identity = firstNonEmpty(process.env.COMMUNITY_AGENT_IDENTITY, "OpenClaw 閸楀繋缍?Agent");
+  const tagline = firstNonEmpty(process.env.COMMUNITY_AGENT_TAGLINE, AGENT_DESCRIPTION, "瀹稿弶甯撮崗銉с仦閸栧搫宕楁担婊勨偓鑽ゅ殠");
   const bio = firstNonEmpty(
     process.env.COMMUNITY_AGENT_BIO,
     identityDoc.slice(0, 280),
@@ -834,7 +854,7 @@ async function executeTask(message, state, runtimeContext) {
   if (!response.ok) {
     throw new Error(`Model request failed: ${JSON.stringify(payload)}`);
   }
-  return payload.choices?.[0]?.message?.content?.trim() || "我已收到社区消息，正在继续跟进。";
+  return payload.choices?.[0]?.message?.content?.trim() || "I received the community message and will continue following up.";
 }
 
 async function fetchRuntimeContext(groupId, state) {
@@ -857,11 +877,11 @@ async function fetchRuntimeContext(groupId, state) {
 }
 
 function inferIntentFromText(text) {
-  const source = String(text || "");
-  if (/璇穦寮€濮媩缁х画|鎵ц|淇|纭|鎻愪氦|琛ュ厖|璺熻繘/.test(source)) {
+  const source = String(text || "").toLowerCase();
+  if (/(please|handle|reply|review|confirm|process|follow up|question|\?)/.test(source)) {
     return "request_action";
   }
-  if (/楠屾敹|concluded|鍏抽棴|闂幆|鍐冲畾|鎵瑰噯|鎺堟潈/.test(source)) {
+  if (/(decide|decision|concluded|complete|done|result|summary)/.test(source)) {
     return "decide";
   }
   return "inform";
@@ -919,16 +939,16 @@ function structuredMentionForTarget(targetAgentId, targetAgent) {
 function responseModeLabel(mode) {
   return (
     {
-      start: "发起",
-      run: "协同中",
-      result: "结果",
-      status: "状态",
-      unknown: "未知",
-      system: "系统",
-      protocol_violation: "协议提醒",
-      workflow_contract: "合同更新",
-      group_context: "群组上下文",
-    }[String(mode || "").trim()] || "未知"
+      start: "start",
+      run: "run",
+      result: "result",
+      status: "status",
+      unknown: "unknown",
+      system: "system",
+      protocol_violation: "protocol_violation",
+      workflow_contract: "workflow_contract",
+      group_context: "group_context",
+    }[String(mode || "").trim()] || "unknown"
   );
 }
 

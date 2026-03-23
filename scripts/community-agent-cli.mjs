@@ -96,6 +96,7 @@ let currentPhase = 'startup';
 const VERSION_PATH = path.join(SKILL_ROOT, 'VERSION.json');
 const RELEASES_PATH = path.join(SKILL_ROOT, 'RELEASES.json');
 const GIT_BIN = process.env.COMMUNITY_GIT_BIN || (process.platform === 'win32' ? 'D:/Program Files/Git/cmd/git.exe' : 'git');
+const STATE_DIRNAME = '.openclaw';
 
 function loadJsonFile(filePath, fallback = null) {
   try {
@@ -439,6 +440,50 @@ async function requireSavedState(requirements = {}) {
   return { runtime, state };
 }
 
+function localStateCleanupPaths() {
+  const workspaceRoot = loadedContext?.workspaceRoot || resolveWorkspaceRoot();
+  const stateRoot = path.join(workspaceRoot, STATE_DIRNAME);
+  return [
+    path.join(stateRoot, 'community-agent.env'),
+    path.join(stateRoot, 'community-bootstrap.env'),
+    path.join(stateRoot, 'community-agent.bootstrap.json'),
+    path.join(stateRoot, 'community-skill-version.json'),
+    path.join(stateRoot, 'community-send-idempotency.json'),
+    path.join(stateRoot, 'community-agent-template', 'state', 'community-webhook-state.json'),
+    path.join(stateRoot, 'community-agent-template', 'state', 'community-channel-contexts.json'),
+    path.join(stateRoot, 'community-agent-template', 'state', 'community-workflow-contracts.json'),
+    path.join(stateRoot, 'community-agent-template', 'state', 'community-protocol-violations.json'),
+    path.join(stateRoot, 'community-agent-template', 'state', 'community-outbound-receipts.json'),
+    path.join(stateRoot, 'community-agent-template', 'state', 'community-outbound-debug.json'),
+    path.join(stateRoot, 'community-agent-template', 'state', 'community-outbound-guard.json'),
+  ];
+}
+
+async function cmdCleanupLocalState(options) {
+  const confirmed = String(options['confirm-clean-env'] || '').trim().toLowerCase();
+  if (confirmed !== 'true' && confirmed !== 'yes') {
+    throw new Error('cleanup-local-state requires --confirm-clean-env true');
+  }
+  await getRuntime();
+  const targets = localStateCleanupPaths();
+  const removed = [];
+  const missing = [];
+  for (const target of targets) {
+    if (fs.existsSync(target)) {
+      fs.rmSync(target, { force: true });
+      removed.push(target);
+    } else {
+      missing.push(target);
+    }
+  }
+  console.log(JSON.stringify({
+    ok: true,
+    command: 'cleanup-local-state',
+    removed,
+    missing,
+  }, null, 2));
+}
+
 async function cmdStatus() {
   trace('status.load_runtime');
   const runtime = await getRuntime();
@@ -706,6 +751,10 @@ async function main() {
   }
   if (command === "profile-update") {
     await cmdProfileUpdate(options);
+    return;
+  }
+  if (command === 'cleanup-local-state') {
+    await cmdCleanupLocalState(options);
     return;
   }
   throw new Error(`unknown command: ${command}`);

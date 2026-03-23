@@ -100,25 +100,37 @@ detect_public_host() {
     return
   fi
 
-  if command -v ip >/dev/null 2>&1; then
-    local routed_ip
-    routed_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '/src/ {for (i=1; i<=NF; i+=1) if ($i == "src") { print $(i+1); exit }}')"
-    if [[ -n "${routed_ip}" ]]; then
-      printf '%s' "${routed_ip}"
+  local discovery_urls raw_ip
+  discovery_urls="${COMMUNITY_WEBHOOK_IP_DISCOVERY_URLS:-https://api.ipify.org,https://ifconfig.me/ip,https://api.ip.sb/ip}"
+  IFS=',' read -r -a urls <<< "${discovery_urls}"
+  for url in "${urls[@]}"; do
+    url="$(printf '%s' "${url}" | xargs)"
+    [[ -n "${url}" ]] || continue
+    raw_ip=""
+    if command -v curl >/dev/null 2>&1; then
+      raw_ip="$(curl --silent --show-error --fail --max-time 5 "${url}" 2>/dev/null || true)"
+    elif command -v python3 >/dev/null 2>&1; then
+      raw_ip="$(python3 - "${url}" <<'PY'
+import sys
+import urllib.request
+
+url = sys.argv[1]
+try:
+    with urllib.request.urlopen(url, timeout=5) as response:
+        print(response.read().decode('utf-8').strip())
+except Exception:
+    pass
+PY
+)"
+    fi
+    raw_ip="$(printf '%s' "${raw_ip}" | tr -d '\r\n[:space:]')"
+    if [[ "${raw_ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      printf '%s' "${raw_ip}"
       return
     fi
-  fi
+  done
 
-  if command -v hostname >/dev/null 2>&1; then
-    local host_ips
-    host_ips="$(hostname -I 2>/dev/null | awk '{for (i=1; i<=NF; i+=1) if ($i !~ /^127\./) { print $i; exit }}')"
-    if [[ -n "${host_ips}" ]]; then
-      printf '%s' "${host_ips}"
-      return
-    fi
-  fi
-
-  printf '%s' "127.0.0.1"
+  printf '%s' ""
 }
 
 quote_env_value() {
@@ -249,7 +261,13 @@ WEBHOOK_PORT="${COMMUNITY_WEBHOOK_PORT:-8848}"
 WEBHOOK_PATH="${COMMUNITY_WEBHOOK_PATH:-/webhook/${AGENT_SLUG}}"
 SEND_PATH="${COMMUNITY_SEND_PATH:-/send/${AGENT_SLUG}}"
 WEBHOOK_PUBLIC_HOST="${COMMUNITY_WEBHOOK_PUBLIC_HOST:-$(detect_public_host)}"
-WEBHOOK_PUBLIC_URL="${COMMUNITY_WEBHOOK_PUBLIC_URL:-http://${WEBHOOK_PUBLIC_HOST}:${WEBHOOK_PORT}${WEBHOOK_PATH}}"
+if [[ -n "${COMMUNITY_WEBHOOK_PUBLIC_URL:-}" ]]; then
+  WEBHOOK_PUBLIC_URL="${COMMUNITY_WEBHOOK_PUBLIC_URL}"
+elif [[ -n "${WEBHOOK_PUBLIC_HOST}" ]]; then
+  WEBHOOK_PUBLIC_URL="http://${WEBHOOK_PUBLIC_HOST}:${WEBHOOK_PORT}${WEBHOOK_PATH}"
+else
+  WEBHOOK_PUBLIC_URL=""
+fi
 AGENT_DESCRIPTION="${COMMUNITY_AGENT_DESCRIPTION:-OpenClaw community-connected agent}"
 AGENT_DISPLAY_NAME="${COMMUNITY_AGENT_DISPLAY_NAME:-${AGENT_NAME}}"
 AGENT_IDENTITY="${COMMUNITY_AGENT_IDENTITY:-OpenClaw community agent}"

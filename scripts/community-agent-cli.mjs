@@ -227,7 +227,7 @@ function writeVersionState(payload) {
   return versionStatePath;
 }
 
-function maybeRunOnboarding() {
+function maybeRunOnboarding(runOptions = {}) {
   if (process.platform === 'win32') {
     return { ran: false, reason: 'unsupported_platform' };
   }
@@ -235,15 +235,20 @@ function maybeRunOnboarding() {
   if (!fs.existsSync(scriptPath)) {
     return { ran: false, reason: 'missing_onboarding_script' };
   }
+  const env = {
+    ...process.env,
+    ...(runOptions.env || {}),
+  };
   const result = spawnSync('bash', [scriptPath], {
     cwd: resolveWorkspaceRoot(),
     stdio: 'inherit',
     encoding: 'utf8',
+    env,
   });
   if (result.status !== 0) {
     throw new Error(`onboarding refresh failed with exit code ${result.status}`);
   }
-  return { ran: true, reason: 'onboarding_refreshed' };
+  return { ran: true, reason: runOptions.reason || 'onboarding_refreshed' };
 }
 
 function trace(phase, extra = {}) {
@@ -481,6 +486,211 @@ async function cmdCleanupLocalState(options) {
     command: 'cleanup-local-state',
     removed,
     missing,
+  }, null, 2));
+}
+
+function isTruthy(value) {
+  return ["1", "true", "yes", "y", "on"].includes(String(value || "").trim().toLowerCase());
+}
+
+function resolveFirstNonEmptyEnv(keys) {
+  for (const key of keys) {
+    const value = String(process.env[key] || "").trim();
+    if (value) {
+      return { key, value };
+    }
+  }
+  return { key: null, value: "" };
+}
+
+function detectModelConfigSources(options = {}) {
+  const base = String(options['model-base-url'] || '').trim();
+  const key = String(options['model-api-key'] || '').trim();
+  const model = String(options['model-id'] || '').trim();
+  const envBase = resolveFirstNonEmptyEnv(["MODEL_BASE_URL", "OPENAI_BASE_URL", "OPENAI_API_BASE", "LLM_BASE_URL"]);
+  const envKey = resolveFirstNonEmptyEnv(["MODEL_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"]);
+  const envModel = resolveFirstNonEmptyEnv(["MODEL_ID", "OPENAI_MODEL", "OPENAI_MODEL_ID", "DEFAULT_MODEL", "MODEL"]);
+  return {
+    base_url: base || envBase.value || '',
+    api_key: key || envKey.value || '',
+    model_id: model || envModel.value || '',
+    sources: {
+      base_url: base ? 'cli' : (envBase.key || null),
+      api_key: key ? 'cli' : (envKey.key || null),
+      model_id: model ? 'cli' : (envModel.key || null),
+    },
+  };
+}
+
+function onboardingProfileOverrides(options = {}) {
+  return pruneEmpty({
+    display_name: options["display-name"],
+    handle: options.handle,
+    identity: options.identity,
+    tagline: options.tagline,
+    bio: options.bio,
+    avatar_text: options["avatar-text"],
+    accent_color: options["accent-color"],
+    expertise: options.expertise
+      ? String(options.expertise).split(',').map((item) => item.trim()).filter(Boolean)
+      : undefined,
+  });
+}
+
+function buildOnboardingPlan(mode, options = {}) {
+  const model = detectModelConfigSources(options);
+  const confirmPortOpen = isTruthy(options['confirm-port-open']);
+  const runRequested = isTruthy(options.run) || isTruthy(options['execute-onboarding']);
+  const profileOverrides = onboardingProfileOverrides(options);
+  const profileReady = Object.keys(profileOverrides).length > 0;
+  const hasModel = Boolean(model.base_url && model.api_key && model.model_id);
+  const steps = [
+    {
+      step: 'step1',
+      name: 'choose_mode',
+      status: 'confirmed',
+      detail: mode === 'auto' ? 'full_auto_selected' : 'semi_auto_selected',
+      prompt: mode === 'auto' ? 'Full auto onboarding selected' : 'Guided onboarding selected',
+    },
+    {
+      step: 'step2',
+      name: 'confirm_port_8848',
+      status: confirmPortOpen ? 'confirmed' : 'blocked',
+      detail: confirmPortOpen ? 'port_8848_confirmed_open' : 'manual_firewall_or_gateway_action_required',
+      prompt: confirmPortOpen ? 'Port 8848 confirmed open' : 'Open port 8848 or allow it in firewall rules first',
+    },
+    {
+      step: 'step3',
+      name: 'configure_model',
+      status: hasModel ? 'ready' : 'blocked',
+      detail: hasModel ? 'model_config_available' : 'model_config_missing',
+      prompt: hasModel ? 'Usable model config detected' : 'Provide model config or expose inheritable agent model config',
+      model_sources: model.sources,
+    },
+    {
+      step: 'step4',
+      name: 'run_onboarding',
+      status: (confirmPortOpen && hasModel && runRequested) ? 'ready' : 'pending',
+      detail: runRequested ? 'ready_to_execute_onboarding_script' : 'awaiting_run_confirmation',
+      prompt: runRequested ? 'Onboarding script is ready to run' : 'Rerun with --run true after prerequisites are ready',
+    },
+    {
+      step: 'step5',
+      name: 'configure_profile',
+      status: profileReady ? 'ready' : 'optional',
+      detail: profileReady ? 'profile_overrides_supplied' : 'profile_sync_with_existing_identity',
+      prompt: profileReady ? 'Provided community profile fields will be applied' : 'Existing identity will be synced if no profile overrides are given',
+    },
+  ];
+  const blockers = steps
+    .filter((item) => item.status === 'blocked')
+    .map((item) => ({ step: item.step, name: item.name, detail: item.detail, prompt: item.prompt }));
+  const runnable = confirmPortOpen && hasModel && runRequested;
+  const recommendedCommand = mode === 'auto'
+    ? 'node ./scripts/community-agent-cli.mjs onboarding --mode auto --confirm-port-open true --run true'
+    : 'node ./scripts/community-agent-cli.mjs onboarding --mode guided --confirm-port-open true --model-base-url <url> --model-api-key <key> --model-id <model> --run true';
+  const manualActions = [];
+  if (!confirmPortOpen) {
+    manualActions.push('Open port 8848 and make sure the community server can reach the webhook endpoint');
+  }
+  if (!hasModel) {
+    manualActions.push('Provide MODEL_BASE_URL / MODEL_API_KEY / MODEL_ID, or expose inheritable agent model config');
+  }
+  if (!runRequested) {
+    manualActions.push('After prerequisites are done, rerun onboarding with --run true');
+  }
+  return {
+    mode,
+    runnable,
+    confirm_port_open: confirmPortOpen,
+    run_requested: runRequested,
+    model,
+    profile_overrides: profileOverrides,
+    steps,
+    blockers,
+    manual_actions: manualActions,
+    recommended_command: recommendedCommand,
+    fallback_mode: mode === 'auto' && !runnable ? 'guided' : null,
+  };
+}
+
+async function cmdOnboarding(options) {
+  trace('onboarding.command_start');
+  await getRuntime();
+  const mode = String(options.mode || 'auto').trim().toLowerCase() || 'auto';
+  if (!['auto', 'guided', 'semi-auto', 'semi_auto', 'manual'].includes(mode)) {
+    throw new Error('onboarding requires --mode auto or --mode guided');
+  }
+  const normalizedMode = ['guided', 'semi-auto', 'semi_auto', 'manual'].includes(mode) ? 'guided' : 'auto';
+  const plan = buildOnboardingPlan(normalizedMode, options);
+
+  if (!plan.runnable) {
+    console.log(JSON.stringify({
+      ok: true,
+      command: 'onboarding',
+      mode: normalizedMode,
+      runnable: false,
+      blockers: plan.blockers,
+      steps: plan.steps,
+      manual_actions: plan.manual_actions,
+      recommended_command: plan.recommended_command,
+      fallback_mode: plan.fallback_mode,
+      next_action: normalizedMode === 'auto'
+        ? 'Full auto onboarding selectedFull auto onboarding selected?????? guided ??????'
+        : 'Full auto onboarding selected? --confirm-port-open true ? --run true ????',
+    }, null, 2));
+    trace('onboarding.plan_emitted', { mode: normalizedMode, blockers: plan.blockers.length });
+    return;
+  }
+
+  const envOverrides = {
+    MODEL_BASE_URL: plan.model.base_url,
+    MODEL_API_KEY: plan.model.api_key,
+    MODEL_ID: plan.model.model_id,
+  };
+
+  trace('onboarding.run_script', { mode: normalizedMode });
+  const refresh = maybeRunOnboarding({ env: envOverrides, reason: `onboarding_${normalizedMode}` });
+  trace('onboarding.script_completed', { onboarding: refresh });
+
+  if (!refresh?.ran) {
+    console.log(JSON.stringify({
+      ok: true,
+      command: 'onboarding',
+      mode: normalizedMode,
+      runnable: false,
+      onboarding: refresh,
+      blockers: [
+        {
+          step: 'step4',
+          name: 'run_onboarding',
+          detail: refresh?.reason || 'onboarding_not_executed',
+          prompt: 'This platform cannot execute the onboarding script directly; use a supported environment or agent-side install flow',
+        },
+      ],
+      steps: plan.steps.map((item) => item.step === 'step4' ? { ...item, status: 'blocked', detail: refresh?.reason || item.detail } : item),
+      next_action: 'Run onboarding on Linux/supported environment, or continue through the agent-side install flow',
+    }, null, 2));
+    return;
+  }
+
+  const profileOverrides = plan.profile_overrides;
+  trace('onboarding.profile_step_start');
+  const { runtime, state } = await requireSavedState({ token: true });
+  const updated = Object.keys(profileOverrides).length > 0
+    ? await runtime.updateCommunityProfile(state, profileOverrides)
+    : await runtime.updateCommunityProfile(state);
+  runtime.saveCommunityState(updated);
+  trace('onboarding.profile_step_completed');
+
+  console.log(JSON.stringify({
+    ok: true,
+    command: 'onboarding',
+    mode: normalizedMode,
+    onboarding: refresh,
+    model_sources: plan.model.sources,
+    profile: updated.profile || null,
+    steps: plan.steps.map((item) => ({ ...item, status: 'completed' })),
   }, null, 2));
 }
 
@@ -747,6 +957,10 @@ async function main() {
   }
   if (command === "profile-sync") {
     await cmdProfileSync();
+    return;
+  }
+  if (command === "onboarding") {
+    await cmdOnboarding(options);
     return;
   }
   if (command === "profile-update") {

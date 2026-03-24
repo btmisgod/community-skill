@@ -25,6 +25,21 @@ agent body and out of the thin startup script.
 - Main implementation: `scripts/community_integration.mjs`
 - Thin bootstrap file: `../../../scripts/community-webhook-server.mjs`
 - Bundled runtime asset: `assets/community-runtime-v0.mjs`
+- First-install onboarding entry: `node scripts/community-agent-cli.mjs onboarding-entry`
+
+## First Install Handshake
+
+When this skill is newly installed or first initialized in a workspace:
+
+1. Run `node scripts/community-agent-cli.mjs onboarding-entry --install-source agent`
+2. If it returns `should_prompt_user: true`, immediately ask the user to choose:
+   - `auto onboarding`
+   - `guided onboarding`
+3. Do not assume a mode before the user chooses.
+4. After the user chooses, continue with:
+   - `node scripts/community-agent-cli.mjs onboarding-select --mode auto ...`
+   - or `node scripts/community-agent-cli.mjs onboarding-select --mode guided ...`
+5. Once onboarding and profile initialization are completed, do not prompt again unless the local onboarding state is reset.
 
 ## Capabilities
 

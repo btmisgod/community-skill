@@ -71,6 +71,10 @@ function preferredAssetPath(name) {
   if (fs.existsSync(workspaceAsset)) {
     return workspaceAsset;
   }
+  const workspaceTopLevelAsset = path.join(WORKSPACE, name);
+  if (fs.existsSync(workspaceTopLevelAsset)) {
+    return workspaceTopLevelAsset;
+  }
   return path.join(ASSETS_DIR, name);
 }
 let runtimeModulePromise = null;
@@ -418,16 +422,118 @@ function profileFingerprint(profile) {
   return crypto.createHash("sha256").update(JSON.stringify(stableValue(profile || {}))).digest("hex");
 }
 
+function meaningfulLines(text) {
+  return String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^#+\s*/, "").replace(/^[-*]\s*/, "").trim())
+    .filter(Boolean);
+}
+
+function extractLabeledValue(text, labels = []) {
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    const line = String(rawLine || "").trim();
+    for (const label of labels) {
+      const match = line.match(new RegExp(`^${label}\\s*[:：]\\s*(.+)$`, "i"));
+      if (match?.[1]) {
+        return match[1].trim();
+      }
+    }
+  }
+  return "";
+}
+
+function extractSectionItems(text, headings = []) {
+  const lines = String(text || "").split(/\r?\n/);
+  let active = false;
+  const items = [];
+  for (const rawLine of lines) {
+    const line = String(rawLine || "").trim();
+    if (!line) {
+      continue;
+    }
+    if (headings.some((heading) => new RegExp(`^${heading}\\s*[:：]?$`, "i").test(line))) {
+      active = true;
+      continue;
+    }
+    if (active && /^[^\s].*[:：]$/.test(line)) {
+      break;
+    }
+    if (active) {
+      items.push(line.replace(/^[-*]\s*/, "").trim());
+    }
+  }
+  return items.filter(Boolean);
+}
+
+function firstMeaningfulLine(text, maxLength = 120) {
+  const firstLine = meaningfulLines(text).find(
+    (line) =>
+      !/\.md\b|who am i|user\.md/i.test(line) &&
+      !/[：:]$/.test(line) &&
+      !/^(姓名|name|性别|生日|星座|年龄|身高|体重|发色|瞳色)\s*[:：]?/i.test(line),
+  );
+  return String(firstLine || "").slice(0, maxLength).trim();
+}
+
+function inferExpertise(identityDoc, userDoc) {
+  const matches = [];
+  for (const line of [...meaningfulLines(identityDoc), ...meaningfulLines(userDoc)]) {
+    if (!/(expertise|skills|focus|domains|擅长|负责|领域)/i.test(line)) {
+      continue;
+    }
+    const cleaned = line.split(/[:：]/).slice(1).join(":").trim() || line;
+    for (const item of cleaned.split(/[、,，/]/)) {
+      const normalized = String(item || "").trim();
+      if (normalized) {
+        matches.push(normalized);
+      }
+    }
+  }
+  return Array.from(new Set(matches)).slice(0, 6);
+}
+
 function buildProfile() {
   const identityDoc = loadText(preferredAssetPath("IDENTITY.md"));
   const soulDoc = loadText(preferredAssetPath("SOUL.md"));
-  const displayName = firstNonEmpty(process.env.COMMUNITY_AGENT_DISPLAY_NAME, AGENT_NAME);
+  const userDoc = loadText(preferredAssetPath("USER.md"));
+  const inferredName = extractLabeledValue(identityDoc, ["姓名", "name"]);
+  const inferredRole = firstNonEmpty(
+    extractSectionItems(identityDoc, ["核心职责", "技能与职责"])[0],
+    extractSectionItems(userDoc, ["技能与职责", "核心职责"])[0],
+  );
+  const inferredSoulTagline = firstNonEmpty(
+    extractSectionItems(soulDoc, ["身份", "价值观", "行为准则"])[0],
+    extractSectionItems(userDoc, ["工作风格", "情绪与表达"])[0],
+  );
+  const inferredIdentity = firstMeaningfulLine(identityDoc, 160);
+  const inferredTagline = firstMeaningfulLine(soulDoc, 120);
+  const inferredBio = [firstMeaningfulLine(identityDoc, 180), firstMeaningfulLine(userDoc, 180)]
+    .filter(Boolean)
+    .join(" ");
+  const configuredDisplayName = firstNonEmpty(process.env.COMMUNITY_AGENT_DISPLAY_NAME);
+  const displayName =
+    configuredDisplayName && configuredDisplayName !== AGENT_NAME
+      ? configuredDisplayName
+      : firstNonEmpty(inferredName, configuredDisplayName, AGENT_NAME);
   const handle = slugifyHandle(firstNonEmpty(process.env.COMMUNITY_AGENT_HANDLE, displayName));
-  const identity = firstNonEmpty(process.env.COMMUNITY_AGENT_IDENTITY, "OpenClaw community agent");
-  const tagline = firstNonEmpty(process.env.COMMUNITY_AGENT_TAGLINE, AGENT_DESCRIPTION, "Connected to the shared community ingress");
+  const configuredIdentity = firstNonEmpty(process.env.COMMUNITY_AGENT_IDENTITY);
+  const identity =
+    configuredIdentity && configuredIdentity !== "OpenClaw community agent"
+      ? configuredIdentity
+      : firstNonEmpty(inferredRole, inferredIdentity, configuredIdentity, "OpenClaw community agent");
+  const configuredTagline = firstNonEmpty(process.env.COMMUNITY_AGENT_TAGLINE);
+  const tagline = firstNonEmpty(
+    configuredTagline && configuredTagline !== "Connected to the shared community ingress" ? configuredTagline : "",
+    inferredSoulTagline,
+    inferredTagline,
+    AGENT_DESCRIPTION,
+    "Connected to the shared community ingress",
+  );
   const bio = firstNonEmpty(
     process.env.COMMUNITY_AGENT_BIO,
+    inferredBio,
     identityDoc.slice(0, 280),
+    userDoc.slice(0, 280),
     soulDoc.slice(0, 280),
     AGENT_DESCRIPTION,
   );
@@ -437,6 +543,7 @@ function buildProfile() {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+  const inferredExpertise = expertise.length > 0 ? expertise : inferExpertise(identityDoc, userDoc);
 
   return {
     display_name: displayName,
@@ -446,7 +553,7 @@ function buildProfile() {
     bio,
     avatar_text: avatarText,
     accent_color: accentColor || undefined,
-    expertise,
+    expertise: inferredExpertise,
   };
 }
 

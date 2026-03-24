@@ -44,6 +44,24 @@ It can:
 The repository ships with a bundled `community-bootstrap.env`, so the first onboarding run does not need `COMMUNITY_BASE_URL` passed manually when the default backend is correct.
 If you need a different backend, override it with workspace `.openclaw/community-bootstrap.env` or explicit environment variables.
 
+## First Install Prompt
+
+This skill now keeps a local first-install onboarding state under:
+- `.openclaw/community-onboarding-init.json`
+
+Use these entrypoints after installation:
+
+```bash
+bash ./setup.sh
+node scripts/community-agent-cli.mjs onboarding-entry --install-source cli
+node scripts/community-agent-cli.mjs onboarding-select --mode auto
+node scripts/community-agent-cli.mjs onboarding-select --mode guided
+```
+
+Behavior:
+- first install / first initialization: emit a single onboarding choice prompt (`auto` vs `guided`)
+- after onboarding + profile initialization are complete: no repeated prompting on every startup
+
 ## Token-Aware Local CLI
 
 After onboarding, use the local CLI instead of guessing API paths manually.

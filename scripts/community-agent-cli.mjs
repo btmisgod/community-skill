@@ -97,6 +97,7 @@ const VERSION_PATH = path.join(SKILL_ROOT, 'VERSION.json');
 const RELEASES_PATH = path.join(SKILL_ROOT, 'RELEASES.json');
 const GIT_BIN = process.env.COMMUNITY_GIT_BIN || (process.platform === 'win32' ? 'D:/Program Files/Git/cmd/git.exe' : 'git');
 const STATE_DIRNAME = '.openclaw';
+const ONBOARDING_INIT_STATE = 'community-onboarding-init.json';
 
 function loadJsonFile(filePath, fallback = null) {
   try {
@@ -395,6 +396,59 @@ function writeVersionState(payload) {
   fs.writeFileSync(versionStatePath, `${JSON.stringify(payload, null, 2)}
 `);
   return versionStatePath;
+}
+
+function onboardingInitStatePath() {
+  const workspaceRoot = loadedContext?.workspaceRoot || resolveWorkspaceRoot();
+  return path.join(workspaceRoot, STATE_DIRNAME, ONBOARDING_INIT_STATE);
+}
+
+function loadOnboardingInitState() {
+  return (
+    loadJsonFile(onboardingInitStatePath(), {
+      version: 1,
+      promptIssuedAt: null,
+      promptInstallSource: null,
+      selectedMode: null,
+      selectedAt: null,
+      onboardingCompletedAt: null,
+      profileInitializedAt: null,
+      lastResult: null,
+    }) || {}
+  );
+}
+
+function saveOnboardingInitState(patch = {}) {
+  const next = {
+    version: 1,
+    ...loadOnboardingInitState(),
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  const target = onboardingInitStatePath();
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, `${JSON.stringify(next, null, 2)}
+`);
+  return next;
+}
+
+function onboardingStateSummary() {
+  const state = loadOnboardingInitState();
+  const envValues = parseJsonEnvFile(path.join(resolveWorkspaceRoot(), STATE_DIRNAME, 'community-agent.env'));
+  const runtimeState = loadJsonFile(
+    path.join(resolveWorkspaceRoot(), STATE_DIRNAME, 'community-agent-template', 'state', 'community-webhook-state.json'),
+    {},
+  ) || {};
+  const initialized = Boolean(
+    runtimeState.token &&
+      runtimeState.groupId &&
+      runtimeState.profileCompleted &&
+      envValues.MODEL_BASE_URL &&
+      envValues.MODEL_API_KEY &&
+      envValues.MODEL_ID &&
+      envValues.COMMUNITY_WEBHOOK_PUBLIC_URL,
+  );
+  return { state, envValues, runtimeState, initialized };
 }
 
 function maybeRunOnboarding(runOptions = {}) {
@@ -1017,8 +1071,7 @@ async function cmdProfileUpdate(options) {
   trace("profile-update.success");
 }
 
-async function cmdOnboarding(options) {
-  trace('onboarding.command_start');
+async function runOnboardingFlow(options) {
   const workspaceRoot = resolveWorkspaceRoot();
   const stateDir = path.join(workspaceRoot, '.openclaw');
   const savedEnv = parseJsonEnvFile(path.join(stateDir, 'community-agent.env'));
@@ -1130,6 +1183,7 @@ async function cmdOnboarding(options) {
       mode: profileMode,
       profile: updated.profile || null,
       agentId: updated.agentId || null,
+      derived_from_identity: Object.keys(profileOverrides).length === 0,
     };
   }
   addStep('configure_profile', {
@@ -1143,7 +1197,7 @@ async function cmdOnboarding(options) {
   });
 
   const envAfter = parseJsonEnvFile(path.join(stateDir, 'community-agent.env'));
-  const result = {
+  return {
     ok: blockers.length === 0,
     command: 'onboarding',
     mode,
@@ -1164,7 +1218,116 @@ async function cmdOnboarding(options) {
       model_source: envAfter.COMMUNITY_MODEL_CONFIG_SOURCE || null,
     },
   };
+}
+
+async function cmdOnboarding(options) {
+  trace('onboarding.command_start');
+  const result = await runOnboardingFlow(options);
+  if (result.ok) {
+    saveOnboardingInitState({
+      selectedMode: result.mode,
+      onboardingCompletedAt: new Date().toISOString(),
+      profileInitializedAt: new Date().toISOString(),
+      lastResult: 'completed',
+    });
+  } else {
+    saveOnboardingInitState({
+      selectedMode: result.mode,
+      selectedAt: new Date().toISOString(),
+      lastResult: 'blocked',
+    });
+  }
   console.log(JSON.stringify(result, null, 2));
+}
+
+async function cmdOnboardingEntry(options) {
+  trace('onboarding-entry.command_start');
+  await getRuntime();
+  const installSource = String(options['install-source'] || 'agent').trim().toLowerCase();
+  const { state, initialized } = onboardingStateSummary();
+  if (initialized) {
+    saveOnboardingInitState({
+      onboardingCompletedAt: state.onboardingCompletedAt || new Date().toISOString(),
+      profileInitializedAt: state.profileInitializedAt || new Date().toISOString(),
+      lastResult: 'already_initialized',
+    });
+    console.log(JSON.stringify({
+      ok: true,
+      command: 'onboarding-entry',
+      install_source: installSource,
+      should_prompt_user: false,
+      needs_user_choice: false,
+      status: 'already_initialized',
+      state_path: onboardingInitStatePath(),
+    }, null, 2));
+    return;
+  }
+
+  const promptAlreadyIssued = Boolean(state.promptIssuedAt);
+  const nextState = promptAlreadyIssued
+    ? saveOnboardingInitState({ lastResult: 'awaiting_user_choice' })
+    : saveOnboardingInitState({
+        promptIssuedAt: new Date().toISOString(),
+        promptInstallSource: installSource,
+        lastResult: 'prompt_issued',
+      });
+
+  console.log(JSON.stringify({
+    ok: true,
+    command: 'onboarding-entry',
+    install_source: installSource,
+    should_prompt_user: !promptAlreadyIssued,
+    needs_user_choice: true,
+    status: promptAlreadyIssued ? 'awaiting_user_choice' : 'prompt_now',
+    prompt: !promptAlreadyIssued
+      ? 'CommunityIntegrationSkill 已安装。请选择接入方式：auto onboarding 还是 guided onboarding。'
+      : null,
+    choices: [
+      {
+        mode: 'auto',
+        command: 'node scripts/community-agent-cli.mjs onboarding-select --mode auto --confirm-port-open true',
+        description: '一键自动接入；遇到端口或模型阻塞时会建议回退到 guided',
+      },
+      {
+        mode: 'guided',
+        command: 'node scripts/community-agent-cli.mjs onboarding-select --mode guided',
+        description: '半自动分步接入；按五步流程逐项确认',
+      },
+    ],
+    state_path: onboardingInitStatePath(),
+    state: {
+      promptIssuedAt: nextState.promptIssuedAt || null,
+      selectedMode: nextState.selectedMode || null,
+      onboardingCompletedAt: nextState.onboardingCompletedAt || null,
+    },
+  }, null, 2));
+}
+
+async function cmdOnboardingSelect(options) {
+  trace('onboarding-select.command_start');
+  const mode = String(options.mode || '').trim().toLowerCase();
+  if (!['auto', 'guided'].includes(mode)) {
+    throw new Error('onboarding-select requires --mode auto|guided');
+  }
+  saveOnboardingInitState({
+    selectedMode: mode,
+    selectedAt: new Date().toISOString(),
+    lastResult: 'choice_selected',
+  });
+  const result = await runOnboardingFlow({ ...options, mode });
+  saveOnboardingInitState({
+    selectedMode: mode,
+    selectedAt: new Date().toISOString(),
+    onboardingCompletedAt: result.ok ? new Date().toISOString() : null,
+    profileInitializedAt: result.ok ? new Date().toISOString() : null,
+    lastResult: result.ok ? 'completed' : 'blocked',
+  });
+  console.log(JSON.stringify({
+    ok: result.ok,
+    command: 'onboarding-select',
+    selection: mode,
+    onboarding: result,
+  }, null, 2));
 }
 
 async function main() {
@@ -1199,16 +1362,20 @@ async function main() {
     await cmdProfileSync();
     return;
   }
-  if (command === "onboarding") {
-    await cmdOnboarding(options);
-    return;
-  }
   if (command === "profile-update") {
     await cmdProfileUpdate(options);
     return;
   }
   if (command === 'onboarding') {
     await cmdOnboarding(options);
+    return;
+  }
+  if (command === 'onboarding-entry') {
+    await cmdOnboardingEntry(options);
+    return;
+  }
+  if (command === 'onboarding-select') {
+    await cmdOnboardingSelect(options);
     return;
   }
   if (command === 'cleanup-local-state') {

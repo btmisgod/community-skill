@@ -1,4 +1,4 @@
-import crypto from "node:crypto";
+﻿import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -365,6 +365,9 @@ async function request(pathname, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   if (options.token) {
     headers["X-Agent-Token"] = options.token;
+  }
+  if (pathname === "/messages" && options.token) {
+    headers["X-Community-Skill-Channel"] = "community-skill-v1";
   }
   const response = await fetch(`${BASE_URL}${pathname}`, {
     ...options,
@@ -1198,50 +1201,23 @@ function canonicalMessageFromPayload(sendContext, payload, state) {
   });
 }
 
-function decideCommunityResponse(obligation, mode, decisionContext = {}) {
-  const contextFlags = decisionContext?.contextFlags || {};
-
-  if (obligation === "required") {
-    return { action: contextFlags.question ? "full_reply" : "brief_reply", reason: "required_obligation" };
+function extractJsonObject(text) {
+  const source = String(text || "").trim();
+  if (!source) {
+    return null;
   }
-  if (obligation === "required_ack") {
-    return { action: contextFlags.question ? "brief_reply" : "ack", reason: "required_ack" };
+  const fenced = source.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fenced ? fenced[1].trim() : source;
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  if (start === -1 || end === -1 || end < start) {
+    return null;
   }
-  if (obligation === "optional") {
-    if (["start", "run", "result"].includes(mode)) {
-      return { action: "observe_only", reason: "optional_collaboration" };
-    }
-    if (["status", "unknown", "system"].includes(mode)) {
-      return { action: "observe_only", reason: "optional_signal" };
-    }
+  try {
+    return JSON.parse(candidate.slice(start, end + 1));
+  } catch {
+    return null;
   }
-  return { action: "observe_only", reason: "observe_only_default" };
-}
-
-function buildFallbackReplyText(message, state, runtimeContext, dispatchContext = {}) {
-  const responseDecision = dispatchContext?.responseDecision || { action: "observe_only" };
-  const contextFlags = dispatchContext?.contextFlags || {};
-  const mode = dispatchContext?.mode || dispatchContext?.category || "unknown";
-  const label = responseModeLabel(mode);
-  const displayName = state?.profile?.display_name || state?.agentName || "OpenClaw Agent";
-
-  if (responseDecision.action === "ack") {
-    return `?????${label}???????????????????????? ${displayName} ??????`;
-  }
-  if (responseDecision.action === "brief_reply") {
-    if (contextFlags.question) {
-      return `?????${label}??????????????????????????????????????????`;
-    }
-    return `?????${label}??????????????????????????????`;
-  }
-  if (responseDecision.action === "full_reply") {
-    return `?????${label}?????????????????????????????????????`;
-  }
-  return "";
-}
-
-async function generateCommunityReply(message, state, runtimeContext, dispatchContext = {}) {
-  return buildFallbackReplyText(message, state, runtimeContext, dispatchContext);
 }
 
 function pruneNullish(value) {
@@ -1315,10 +1291,6 @@ export function buildDirectedCollaborationMessage(state, sendContext, payload) {
 }
 
 export async function sendCommunityMessage(state, incomingMessage, payload) {
-  const action = String(payload?.action || payload?.responseDecision?.action || "").trim().toLowerCase();
-  if (["observe_only", "ignore", "no_action"].includes(action)) {
-    return { skipped: true, action };
-  }
   assertOutboundSendAllowed();
   const sendContext = buildSendContext(state, incomingMessage, payload);
   const requestBody = buildCommunityMessage(state, sendContext, payload);
@@ -1378,17 +1350,81 @@ function incomingMessageForRuntime(runtimeMessage) {
   };
 }
 
+async function deliberateCommunityResponse(message, state, runtimeContext, judgment) {
+  const model = loadModelConfig();
+  const identity = loadText(preferredAssetPath("IDENTITY.md"));
+  const soul = loadText(preferredAssetPath("SOUL.md"));
+  const user = loadText(preferredAssetPath("USER.md"));
+  const agentProtocol = installedAgentProtocolText();
+  const response = await fetch(`${model.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${model.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: model.modelId,
+      messages: [
+        {
+          role: "system",
+          content: [
+            `You are the OpenClaw community collaboration agent ${state.profile?.display_name || state.agentName}.`,
+            "You are now in the agent deliberation layer.",
+            "Runtime already judged minimum obligation. You must decide whether to publicly reply in the same group.",
+            "Return JSON only with fields: should_reply (boolean), reply_text (string), message_type (string), reason (string).",
+            "If obligation is required, should_reply must be true unless the message is malformed or impossible to answer.",
+            "If obligation is optional, you may choose not to reply.",
+            "reply_text must be concise Chinese suitable for public community posting.",
+            "Do not expose chain-of-thought. Do not restate the whole protocol.",
+            agentProtocol,
+            runtimeInstructions(runtimeContext),
+            channelContextInstructions(message?.group_id),
+            workflowContractInstructions(message?.group_id),
+            "Current runtime judgment:",
+            JSON.stringify(judgment, null, 2),
+            "Identity and working context:",
+            identity,
+            soul,
+            user,
+          ].filter(Boolean).join("\n\n"),
+        },
+        {
+          role: "user",
+          content: [
+            "Decide whether to reply to the following community message.",
+            `message_type: ${message.message_type}`,
+            `message_content: ${JSON.stringify(message.content, null, 2)}`,
+          ].join("\n\n"),
+        },
+      ],
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+    }),
+    signal: signalWithTimeout(60000),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(`Model deliberation failed: ${JSON.stringify(payload)}`);
+  }
+  const raw = payload.choices?.[0]?.message?.content?.trim() || "";
+  const parsed = extractJsonObject(raw) || {};
+  return {
+    should_reply: Boolean(parsed.should_reply),
+    reply_text: String(parsed.reply_text || "").trim(),
+    message_type: normalizeOutboundMessageType(parsed.message_type || "analysis"),
+    reason: String(parsed.reason || "").trim() || "agent_deliberation",
+    raw,
+  };
+}
+
 async function executeRuntimeJudgment(state, judgment) {
   const obligation = String(judgment?.obligation?.obligation || "observe_only").trim().toLowerCase();
-  const category = String(judgment?.category || "unknown").trim();
-  const signals = judgment?.signals || {};
   const runtimeMessage = judgment?.message || {};
-  const responseDecision = decideCommunityResponse(obligation, category, { contextFlags: signals });
+  const recommendationMode = String(judgment?.recommendation?.mode || "observe_only").trim().toLowerCase();
 
-  if (["observe_only", "ignore", "no_action"].includes(String(responseDecision?.action || "").trim().toLowerCase())) {
+  if (recommendationMode === "observe_only" || obligation === "observe_only") {
     return {
       ...judgment,
-      decision: responseDecision,
       observed: true,
       no_action: true,
     };
@@ -1404,39 +1440,33 @@ async function executeRuntimeJudgment(state, judgment) {
     }
   }
 
-  let replyText = "";
+  let deliberation;
   try {
-    replyText = await executeTask(executionMessage, state, runtimeContext);
+    deliberation = await deliberateCommunityResponse(executionMessage, state, runtimeContext, judgment);
   } catch {
-    replyText = "";
+    deliberation = {
+      should_reply: false,
+      reply_text: "",
+      message_type: "analysis",
+      reason: "deliberation_failed",
+    };
   }
 
-  if (!String(replyText || "").trim()) {
-    replyText = buildFallbackReplyText(executionMessage, state, runtimeContext, {
-      responseDecision,
-      contextFlags: signals,
-      mode: category,
-      category,
-    });
-  }
-
-  if (!String(replyText || "").trim()) {
+  if (!deliberation?.should_reply || !String(deliberation?.reply_text || "").trim()) {
     return {
       ...judgment,
-      decision: responseDecision,
+      agent_deliberation: deliberation,
       observed: true,
       no_action: true,
     };
   }
 
   const result = await sendCommunityMessage(state, incomingMessageForRuntime(runtimeMessage), {
-    action: responseDecision.action,
-    responseDecision,
     group_id: runtimeMessage.group_id,
     flow_type: "run",
-    message_type: responseDecision.action === "ack" ? "summary" : "analysis",
+    message_type: deliberation.message_type || "analysis",
     content: {
-      text: replyText,
+      text: deliberation.reply_text,
       payload: {},
     },
     relations: {
@@ -1458,7 +1488,7 @@ async function executeRuntimeJudgment(state, judgment) {
 
   return {
     ...judgment,
-    decision: responseDecision,
+    agent_deliberation: deliberation,
     posted: true,
     result,
   };
@@ -1718,4 +1748,5 @@ export async function startCommunityIntegration() {
 
 
 export const loadChannelContext = loadGroupContext;
+
 

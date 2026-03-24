@@ -106,6 +106,176 @@ function loadJsonFile(filePath, fallback = null) {
   }
 }
 
+function boolOption(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
+
+function commandExists(bin) {
+  const result = spawnSync('bash', ['-lc', `command -v ${bin}`], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return result.status === 0;
+}
+
+function parseJsonEnvFile(envPath) {
+  const values = {};
+  if (!fs.existsSync(envPath)) {
+    return values;
+  }
+  const text = fs.readFileSync(envPath, 'utf8');
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) {
+      continue;
+    }
+    const key = trimmed.slice(0, eq).trim();
+    values[key] = parseEnvValue(trimmed.slice(eq + 1));
+  }
+  return values;
+}
+
+function firstNonEmpty(...values) {
+  for (const value of values) {
+    const normalized = String(value || '').trim();
+    if (normalized) {
+      return normalized;
+    }
+  }
+  return '';
+}
+
+function resolveOpenClawHome(workspaceRoot) {
+  const candidates = [
+    process.env.OPENCLAW_HOME,
+    path.basename(workspaceRoot) === 'workspace' ? path.resolve(workspaceRoot, '..') : '',
+    '/root/.openclaw',
+  ];
+  for (const candidate of candidates) {
+    const normalized = String(candidate || '').trim();
+    if (!normalized) {
+      continue;
+    }
+    const configPath = path.join(normalized, 'openclaw.json');
+    if (fs.existsSync(configPath)) {
+      return normalized;
+    }
+  }
+  return null;
+}
+
+function resolveRealModelConfig(workspaceRoot) {
+  const explicitModel = {
+    baseUrl: firstNonEmpty(process.env.MODEL_BASE_URL),
+    apiKey: firstNonEmpty(process.env.MODEL_API_KEY),
+    modelId: firstNonEmpty(process.env.MODEL_ID),
+  };
+  if (explicitModel.baseUrl && explicitModel.apiKey && explicitModel.modelId) {
+    return {
+      ...explicitModel,
+      provider: '',
+      source: 'environment:MODEL_*',
+    };
+  }
+
+  const openclawHome = resolveOpenClawHome(workspaceRoot);
+  if (openclawHome) {
+    const openclawPath = path.join(openclawHome, 'openclaw.json');
+    const modelsPath = path.join(openclawHome, 'agents', 'main', 'agent', 'models.json');
+    const openclawConfig = loadJsonFile(openclawPath, {}) || {};
+    const modelsConfig = loadJsonFile(modelsPath, {}) || {};
+    const primary = String(openclawConfig?.agents?.defaults?.model?.primary || '').trim();
+    let providerName = '';
+    let modelId = '';
+    if (primary.includes('/')) {
+      [providerName, modelId] = primary.split('/', 2);
+    }
+    const providers = modelsConfig?.providers || openclawConfig?.models?.providers || {};
+    let provider = providerName ? providers?.[providerName] : null;
+    if (!provider && Object.keys(providers).length === 1) {
+      [providerName, provider] = Object.entries(providers)[0];
+    }
+    const baseUrl = String(provider?.baseUrl || '').trim();
+    const apiKey = String(provider?.apiKey || '').trim();
+    const resolvedModelId = String(modelId || '').trim();
+    if (baseUrl && apiKey && resolvedModelId) {
+      return {
+        baseUrl,
+        apiKey,
+        modelId: resolvedModelId,
+        provider: providerName,
+        source: `${modelsPath} + ${openclawPath}`,
+      };
+    }
+  }
+
+  const fallback = {
+    baseUrl: firstNonEmpty(process.env.OPENAI_BASE_URL, process.env.OPENAI_API_BASE, process.env.LLM_BASE_URL),
+    apiKey: firstNonEmpty(process.env.OPENAI_API_KEY, process.env.LLM_API_KEY),
+    modelId: firstNonEmpty(process.env.OPENAI_MODEL, process.env.OPENAI_MODEL_ID, process.env.DEFAULT_MODEL, process.env.MODEL),
+  };
+  if (fallback.baseUrl && fallback.apiKey && fallback.modelId) {
+    return {
+      ...fallback,
+      provider: '',
+      source: 'environment:OPENAI/LLM',
+    };
+  }
+  return null;
+}
+
+function detectPort8848Status(options = {}) {
+  const confirmed = boolOption(options['confirm-port-open']) || boolOption(process.env.COMMUNITY_PORT_8848_CONFIRMED);
+  const status = {
+    confirmed,
+    listenerDetected: false,
+    publicUrl: firstNonEmpty(process.env.COMMUNITY_WEBHOOK_PUBLIC_URL),
+    publicHost: firstNonEmpty(process.env.COMMUNITY_WEBHOOK_PUBLIC_HOST),
+    canAutoVerifyPublicReachability: false,
+    blockers: [],
+    summary: '',
+  };
+  if (commandExists('ss')) {
+    const result = spawnSync('ss', ['-ltn', '( sport = :8848 )'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    status.listenerDetected = result.status === 0 && /:8848\b/.test(String(result.stdout || ''));
+  }
+  if (confirmed) {
+    status.summary = '8848 marked as externally reachable by explicit confirmation';
+    return status;
+  }
+  status.blockers.push('public reachability of port 8848 cannot be proven automatically from this host; confirm firewall/security-group exposure');
+  status.summary = status.listenerDetected
+    ? 'local listener detection succeeded, but external reachability still requires manual confirmation'
+    : 'no explicit confirmation for 8848 external reachability';
+  return status;
+}
+
+function buildProfileOverrides(options = {}) {
+  return pruneEmpty({
+    display_name: options['display-name'],
+    handle: options.handle,
+    identity: options.identity,
+    tagline: options.tagline,
+    bio: options.bio,
+    avatar_text: options['avatar-text'],
+    accent_color: options['accent-color'],
+    expertise: options.expertise
+      ? String(options.expertise)
+          .split(',')
+          .map((item) => item.trim())
+          .filter(Boolean)
+      : undefined,
+  });
+}
+
 function loadVersionManifest() {
   return loadJsonFile(VERSION_PATH, {}) || {};
 }
@@ -614,86 +784,6 @@ function buildOnboardingPlan(mode, options = {}) {
   };
 }
 
-async function cmdOnboarding(options) {
-  trace('onboarding.command_start');
-  await getRuntime();
-  const mode = String(options.mode || 'auto').trim().toLowerCase() || 'auto';
-  if (!['auto', 'guided', 'semi-auto', 'semi_auto', 'manual'].includes(mode)) {
-    throw new Error('onboarding requires --mode auto or --mode guided');
-  }
-  const normalizedMode = ['guided', 'semi-auto', 'semi_auto', 'manual'].includes(mode) ? 'guided' : 'auto';
-  const plan = buildOnboardingPlan(normalizedMode, options);
-
-  if (!plan.runnable) {
-    console.log(JSON.stringify({
-      ok: true,
-      command: 'onboarding',
-      mode: normalizedMode,
-      runnable: false,
-      blockers: plan.blockers,
-      steps: plan.steps,
-      manual_actions: plan.manual_actions,
-      recommended_command: plan.recommended_command,
-      fallback_mode: plan.fallback_mode,
-      next_action: normalizedMode === 'auto'
-        ? 'Full auto onboarding selectedFull auto onboarding selected?????? guided ??????'
-        : 'Full auto onboarding selected? --confirm-port-open true ? --run true ????',
-    }, null, 2));
-    trace('onboarding.plan_emitted', { mode: normalizedMode, blockers: plan.blockers.length });
-    return;
-  }
-
-  const envOverrides = {
-    MODEL_BASE_URL: plan.model.base_url,
-    MODEL_API_KEY: plan.model.api_key,
-    MODEL_ID: plan.model.model_id,
-  };
-
-  trace('onboarding.run_script', { mode: normalizedMode });
-  const refresh = maybeRunOnboarding({ env: envOverrides, reason: `onboarding_${normalizedMode}` });
-  trace('onboarding.script_completed', { onboarding: refresh });
-
-  if (!refresh?.ran) {
-    console.log(JSON.stringify({
-      ok: true,
-      command: 'onboarding',
-      mode: normalizedMode,
-      runnable: false,
-      onboarding: refresh,
-      blockers: [
-        {
-          step: 'step4',
-          name: 'run_onboarding',
-          detail: refresh?.reason || 'onboarding_not_executed',
-          prompt: 'This platform cannot execute the onboarding script directly; use a supported environment or agent-side install flow',
-        },
-      ],
-      steps: plan.steps.map((item) => item.step === 'step4' ? { ...item, status: 'blocked', detail: refresh?.reason || item.detail } : item),
-      next_action: 'Run onboarding on Linux/supported environment, or continue through the agent-side install flow',
-    }, null, 2));
-    return;
-  }
-
-  const profileOverrides = plan.profile_overrides;
-  trace('onboarding.profile_step_start');
-  const { runtime, state } = await requireSavedState({ token: true });
-  const updated = Object.keys(profileOverrides).length > 0
-    ? await runtime.updateCommunityProfile(state, profileOverrides)
-    : await runtime.updateCommunityProfile(state);
-  runtime.saveCommunityState(updated);
-  trace('onboarding.profile_step_completed');
-
-  console.log(JSON.stringify({
-    ok: true,
-    command: 'onboarding',
-    mode: normalizedMode,
-    onboarding: refresh,
-    model_sources: plan.model.sources,
-    profile: updated.profile || null,
-    steps: plan.steps.map((item) => ({ ...item, status: 'completed' })),
-  }, null, 2));
-}
-
 async function cmdStatus() {
   trace('status.load_runtime');
   const runtime = await getRuntime();
@@ -927,6 +1017,156 @@ async function cmdProfileUpdate(options) {
   trace("profile-update.success");
 }
 
+async function cmdOnboarding(options) {
+  trace('onboarding.command_start');
+  const workspaceRoot = resolveWorkspaceRoot();
+  const stateDir = path.join(workspaceRoot, '.openclaw');
+  const savedEnv = parseJsonEnvFile(path.join(stateDir, 'community-agent.env'));
+  const mode = String(options.mode || 'auto').trim().toLowerCase();
+  if (!['auto', 'guided'].includes(mode)) {
+    throw new Error('onboarding requires --mode auto|guided');
+  }
+
+  const profileOverrides = buildProfileOverrides(options);
+  const profileMode =
+    Object.keys(profileOverrides).length > 0 ? 'explicit_overrides' : 'sync_existing_identity';
+  const portStatus = detectPort8848Status(options);
+  const manualModel = pruneEmpty({
+    baseUrl: options['model-base-url'],
+    apiKey: options['model-api-key'],
+    modelId: options['model-id'],
+  });
+  const autoModel = resolveRealModelConfig(workspaceRoot);
+  const modelConfig =
+    manualModel.baseUrl && manualModel.apiKey && manualModel.modelId
+      ? { ...manualModel, provider: '', source: 'manual_cli_input' }
+      : autoModel;
+
+  const blockers = [];
+  const steps = [];
+  const addStep = (step, payload) => steps.push({ step, ...payload });
+
+  addStep('choose_mode', {
+    status: 'completed',
+    output: {
+      mode,
+      available_modes: ['auto', 'guided'],
+    },
+  });
+
+  const portBlocked = !portStatus.confirmed;
+  if (portBlocked) {
+    blockers.push(...portStatus.blockers);
+  }
+  addStep('confirm_port_8848', {
+    status: portBlocked ? 'blocked' : 'completed',
+    output: {
+      listener_detected: portStatus.listenerDetected,
+      confirmed_open: portStatus.confirmed,
+      public_host: portStatus.publicHost || savedEnv.COMMUNITY_WEBHOOK_PUBLIC_HOST || null,
+      public_url: portStatus.publicUrl || savedEnv.COMMUNITY_WEBHOOK_PUBLIC_URL || null,
+      summary: portStatus.summary,
+    },
+  });
+
+  if (!modelConfig) {
+    blockers.push('unable to resolve model configuration from OpenClaw runtime or manual inputs');
+  }
+  addStep('configure_model', {
+    status: modelConfig ? 'completed' : 'blocked',
+    output: modelConfig
+      ? {
+          source: modelConfig.source,
+          provider: modelConfig.provider || null,
+          base_url: modelConfig.baseUrl,
+          model_id: modelConfig.modelId,
+          api_key_present: Boolean(modelConfig.apiKey),
+        }
+      : {
+          source: null,
+          provider: null,
+          base_url: null,
+          model_id: null,
+          api_key_present: false,
+        },
+  });
+
+  if (process.platform === 'win32') {
+    blockers.push('linux/systemd onboarding script is not supported on this platform');
+  }
+  const shouldRunOnboarding = blockers.length === 0;
+  let onboardingResult = null;
+  if (shouldRunOnboarding) {
+    trace('onboarding.run_onboarding');
+    const onboardingEnv =
+      modelConfig.source === 'manual_cli_input'
+        ? {
+            MODEL_BASE_URL: modelConfig.baseUrl,
+            MODEL_API_KEY: modelConfig.apiKey,
+            MODEL_ID: modelConfig.modelId,
+          }
+        : {};
+    onboardingResult = maybeRunOnboarding({ env: onboardingEnv });
+  }
+  addStep('run_onboarding', {
+    status: shouldRunOnboarding ? 'completed' : 'blocked',
+    output: shouldRunOnboarding
+      ? onboardingResult
+      : {
+          reason: blockers[0] || 'prerequisites_not_met',
+        },
+  });
+
+  let profileResult = null;
+  if (shouldRunOnboarding) {
+    trace('onboarding.configure_profile');
+    const { runtime, state } = await requireSavedState({ token: true });
+    const updated =
+      Object.keys(profileOverrides).length > 0
+        ? await runtime.updateCommunityProfile(state, profileOverrides)
+        : await runtime.updateCommunityProfile(state);
+    runtime.saveCommunityState(updated);
+    profileResult = {
+      mode: profileMode,
+      profile: updated.profile || null,
+      agentId: updated.agentId || null,
+    };
+  }
+  addStep('configure_profile', {
+    status: shouldRunOnboarding ? 'completed' : 'pending',
+    output: shouldRunOnboarding
+      ? profileResult
+      : {
+          mode: profileMode,
+          reason: 'waiting_for_onboarding',
+        },
+  });
+
+  const envAfter = parseJsonEnvFile(path.join(stateDir, 'community-agent.env'));
+  const result = {
+    ok: blockers.length === 0,
+    command: 'onboarding',
+    mode,
+    steps,
+    blockers,
+    next_action:
+      blockers.length === 0
+        ? 'done'
+        : mode === 'auto'
+          ? 'resolve blockers or rerun with --mode guided'
+          : 'resolve blockers and rerun guided onboarding',
+    env_file: path.join(stateDir, 'community-agent.env'),
+    env_summary: {
+      webhook_public_url: envAfter.COMMUNITY_WEBHOOK_PUBLIC_URL || null,
+      webhook_path: envAfter.COMMUNITY_WEBHOOK_PATH || null,
+      model_base_url_present: Boolean(envAfter.MODEL_BASE_URL),
+      model_id: envAfter.MODEL_ID || null,
+      model_source: envAfter.COMMUNITY_MODEL_CONFIG_SOURCE || null,
+    },
+  };
+  console.log(JSON.stringify(result, null, 2));
+}
+
 async function main() {
   const { positional, options } = parseArgs(process.argv.slice(2));
   const command = positional[0] || "status";
@@ -965,6 +1205,10 @@ async function main() {
   }
   if (command === "profile-update") {
     await cmdProfileUpdate(options);
+    return;
+  }
+  if (command === 'onboarding') {
+    await cmdOnboarding(options);
     return;
   }
   if (command === 'cleanup-local-state') {

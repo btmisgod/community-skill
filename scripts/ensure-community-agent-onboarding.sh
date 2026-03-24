@@ -298,6 +298,102 @@ AGENT_TAGLINE="${COMMUNITY_AGENT_TAGLINE:-Connected to the shared community ingr
 
 validate_base_url "${BASE_URL}"
 
+resolve_model_config() {
+  python3 - "${WORKSPACE_ROOT}" <<'PY'
+import json
+import os
+import pathlib
+import shlex
+import sys
+
+workspace_root = pathlib.Path(sys.argv[1]).resolve()
+
+def first_env(*names: str) -> str:
+    for name in names:
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+base_url = first_env("MODEL_BASE_URL")
+api_key = first_env("MODEL_API_KEY")
+model_id = first_env("MODEL_ID")
+source = ""
+provider_name = ""
+
+if base_url and api_key and model_id:
+    source = "environment:MODEL_*"
+else:
+    candidates = []
+    explicit_home = os.environ.get("OPENCLAW_HOME", "").strip()
+    if explicit_home:
+        candidates.append(pathlib.Path(explicit_home))
+    if workspace_root.name == "workspace":
+        candidates.append(workspace_root.parent)
+    candidates.append(pathlib.Path("/root/.openclaw"))
+
+    openclaw_home = None
+    for candidate in candidates:
+        if not candidate:
+            continue
+        resolved = candidate.resolve()
+        if resolved in candidates[: candidates.index(candidate)]:
+            continue
+        if (resolved / "openclaw.json").is_file():
+            openclaw_home = resolved
+            break
+
+    if openclaw_home is not None:
+        openclaw_config = {}
+        models_config = {}
+        try:
+            openclaw_config = json.loads((openclaw_home / "openclaw.json").read_text(encoding="utf-8"))
+        except Exception:
+            openclaw_config = {}
+        try:
+            models_config = json.loads((openclaw_home / "agents" / "main" / "agent" / "models.json").read_text(encoding="utf-8"))
+        except Exception:
+            models_config = {}
+
+        primary = str(
+            (((openclaw_config.get("agents") or {}).get("defaults") or {}).get("model") or {}).get("primary") or ""
+        ).strip()
+        if "/" in primary:
+            provider_name, primary_model_id = primary.split("/", 1)
+            model_id = model_id or primary_model_id.strip()
+
+        providers = {}
+        if isinstance(models_config.get("providers"), dict):
+            providers = models_config["providers"]
+        elif isinstance(((openclaw_config.get("models") or {}).get("providers")), dict):
+            providers = (openclaw_config.get("models") or {}).get("providers") or {}
+
+        provider = providers.get(provider_name) if provider_name else None
+        if provider is None and len(providers) == 1:
+            provider_name, provider = next(iter(providers.items()))
+        if isinstance(provider, dict):
+            base_url = base_url or str(provider.get("baseUrl") or "").strip()
+            api_key = api_key or str(provider.get("apiKey") or "").strip()
+            source = source or f"{openclaw_home}/agents/main/agent/models.json + {openclaw_home}/openclaw.json"
+
+if not (base_url and api_key and model_id):
+    base_url = base_url or first_env("OPENAI_BASE_URL", "OPENAI_API_BASE", "LLM_BASE_URL")
+    api_key = api_key or first_env("OPENAI_API_KEY", "LLM_API_KEY")
+    model_id = model_id or first_env("OPENAI_MODEL", "OPENAI_MODEL_ID", "DEFAULT_MODEL", "MODEL")
+    if base_url and api_key and model_id:
+        source = source or "environment:OPENAI/LLM"
+
+if base_url and api_key and model_id:
+    print(f"RESOLVED_MODEL_BASE_URL={shlex.quote(base_url.rstrip('/'))}")
+    print(f"RESOLVED_MODEL_API_KEY={shlex.quote(api_key)}")
+    print(f"RESOLVED_MODEL_ID={shlex.quote(model_id)}")
+    print(f"RESOLVED_MODEL_SOURCE={shlex.quote(source or 'unknown')}")
+    print(f"RESOLVED_MODEL_PROVIDER={shlex.quote(provider_name)}")
+PY
+}
+
+eval "$(resolve_model_config)"
+
 SKILL_VERSION="$(python3 - "${SKILL_ROOT}" <<'PY'
 import json
 import pathlib
@@ -352,9 +448,11 @@ COMMUNITY_AGENT_BIO=$(quote_env_value "${COMMUNITY_AGENT_BIO:-}")
 COMMUNITY_AGENT_AVATAR_TEXT=$(quote_env_value "${COMMUNITY_AGENT_AVATAR_TEXT:-}")
 COMMUNITY_AGENT_ACCENT_COLOR=$(quote_env_value "${COMMUNITY_AGENT_ACCENT_COLOR:-}")
 COMMUNITY_AGENT_EXPERTISE=$(quote_env_value "${COMMUNITY_AGENT_EXPERTISE:-}")
-MODEL_BASE_URL=$(quote_env_value "${RESOLVED_MODEL_BASE_URL}")
-MODEL_API_KEY=$(quote_env_value "${RESOLVED_MODEL_API_KEY}")
-MODEL_ID=$(quote_env_value "${RESOLVED_MODEL_ID}")
+COMMUNITY_MODEL_CONFIG_SOURCE=$(quote_env_value "${RESOLVED_MODEL_SOURCE:-}")
+COMMUNITY_MODEL_PROVIDER=$(quote_env_value "${RESOLVED_MODEL_PROVIDER:-}")
+MODEL_BASE_URL=$(quote_env_value "${RESOLVED_MODEL_BASE_URL:-}")
+MODEL_API_KEY=$(quote_env_value "${RESOLVED_MODEL_API_KEY:-}")
+MODEL_ID=$(quote_env_value "${RESOLVED_MODEL_ID:-}")
 EOF
 
 cat >"${BOOTSTRAP_METADATA}" <<EOF

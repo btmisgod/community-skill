@@ -958,10 +958,74 @@ function loadModelConfig() {
   const baseUrl = resolveModelSetting("MODEL_BASE_URL", ["OPENAI_BASE_URL", "OPENAI_API_BASE", "LLM_BASE_URL"]);
   const apiKey = resolveModelSetting("MODEL_API_KEY", ["OPENAI_API_KEY", "LLM_API_KEY"]);
   const modelId = resolveModelSetting("MODEL_ID", ["OPENAI_MODEL", "OPENAI_MODEL_ID", "DEFAULT_MODEL", "MODEL"]);
-  if (!baseUrl || !apiKey || !modelId) {
-    throw new Error("MODEL_BASE_URL, MODEL_API_KEY, and MODEL_ID must be set or inherited from current agent model config");
+  if (baseUrl && apiKey && modelId) {
+    return { baseUrl: baseUrl.replace(/\/$/, ""), apiKey, modelId, source: "environment:MODEL_*" };
   }
-  return { baseUrl: baseUrl.replace(/\/$/, ""), apiKey, modelId };
+  const openClawHomes = [
+    String(process.env.OPENCLAW_HOME || "").trim(),
+    path.basename(WORKSPACE) === "workspace" ? path.resolve(WORKSPACE, "..") : "",
+    "/root/.openclaw",
+  ].filter(Boolean);
+  for (const home of openClawHomes) {
+    const openclawPath = path.join(home, "openclaw.json");
+    if (!fs.existsSync(openclawPath)) {
+      continue;
+    }
+    const openclawConfig = loadJson(openclawPath, {}) || {};
+    const modelsConfig =
+      loadJson(path.join(home, "agents", "main", "agent", "models.json"), {}) || {};
+    const primary = String(
+      openclawConfig?.agents?.defaults?.model?.primary || "",
+    ).trim();
+    let providerName = "";
+    let configuredModelId = modelId;
+    if (primary.includes("/")) {
+      [providerName, configuredModelId] = primary.split("/", 2);
+    }
+    const providers =
+      modelsConfig?.providers ||
+      openclawConfig?.models?.providers ||
+      {};
+    let provider = providerName ? providers?.[providerName] : null;
+    if (!provider && Object.keys(providers).length === 1) {
+      [providerName, provider] = Object.entries(providers)[0];
+    }
+    const resolvedBaseUrl = String(provider?.baseUrl || "").trim();
+    const resolvedApiKey = String(provider?.apiKey || "").trim();
+    const resolvedModelId = String(configuredModelId || "").trim();
+    if (resolvedBaseUrl && resolvedApiKey && resolvedModelId) {
+      return {
+        baseUrl: resolvedBaseUrl.replace(/\/$/, ""),
+        apiKey: resolvedApiKey,
+        modelId: resolvedModelId,
+        source: `${path.join(home, "agents", "main", "agent", "models.json")} + ${openclawPath}`,
+      };
+    }
+  }
+  const fallbackBaseUrl = String(
+    process.env.OPENAI_BASE_URL || process.env.OPENAI_API_BASE || process.env.LLM_BASE_URL || "",
+  ).trim();
+  const fallbackApiKey = String(
+    process.env.OPENAI_API_KEY || process.env.LLM_API_KEY || "",
+  ).trim();
+  const fallbackModelId = String(
+    process.env.OPENAI_MODEL ||
+      process.env.OPENAI_MODEL_ID ||
+      process.env.DEFAULT_MODEL ||
+      process.env.MODEL ||
+      "",
+  ).trim();
+  if (fallbackBaseUrl && fallbackApiKey && fallbackModelId) {
+    return {
+      baseUrl: fallbackBaseUrl.replace(/\/$/, ""),
+      apiKey: fallbackApiKey,
+      modelId: fallbackModelId,
+      source: "environment:OPENAI/LLM",
+    };
+  }
+  throw new Error(
+    "MODEL_BASE_URL/MODEL_API_KEY/MODEL_ID are unset and no OpenClaw runtime model configuration could be resolved",
+  );
 }
 
 function runtimeInstructions(runtimeContext) {
@@ -1804,5 +1868,3 @@ export async function startCommunityIntegration() {
 
 
 export const loadChannelContext = loadGroupContext;
-
-

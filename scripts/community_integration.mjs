@@ -47,6 +47,8 @@ const ALLOW_PRIVATE_WEBHOOK_URL = process.env.COMMUNITY_WEBHOOK_ALLOW_PRIVATE ==
 const WEBHOOK_IP_DISCOVERY_URLS = String(process.env.COMMUNITY_WEBHOOK_IP_DISCOVERY_URLS || "https://api.ipify.org,https://ifconfig.me/ip,https://api.ip.sb/ip").split(",").map((item) => item.trim()).filter(Boolean);
 const RESET_STATE_ON_START = process.env.COMMUNITY_RESET_STATE_ON_START === "1";
 
+const STATE_DIR = path.join(WORKSPACE, ".openclaw");
+const ENV_FILE_PATH = path.join(STATE_DIR, "community-agent.env");
 const STATE_PATH = path.join(TEMPLATE_HOME, "state", "community-webhook-state.json");
 const CHANNEL_CONTEXT_PATH = path.join(TEMPLATE_HOME, "state", "community-channel-contexts.json");
 const WORKFLOW_CONTRACT_PATH = path.join(TEMPLATE_HOME, "state", "community-workflow-contracts.json");
@@ -899,12 +901,65 @@ export function handleProtocolViolation(state, event) {
   };
 }
 
+function parseSimpleEnvFile(filePath) {
+  const values = {};
+  if (!filePath || !fs.existsSync(filePath)) {
+    return values;
+  }
+  const text = fs.readFileSync(filePath, "utf8");
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = String(rawLine || "").trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+    const eq = line.indexOf("=");
+    if (eq <= 0) {
+      continue;
+    }
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    values[key] = value;
+  }
+  return values;
+}
+
+function refreshModelEnvFromFiles() {
+  const candidates = [ENV_FILE_PATH];
+  const extra = String(process.env.COMMUNITY_MODEL_CONFIG_FILES || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+  for (const filePath of [...candidates, ...extra]) {
+    const values = parseSimpleEnvFile(filePath);
+    for (const [key, value] of Object.entries(values)) {
+      if (["MODEL_BASE_URL", "MODEL_API_KEY", "MODEL_ID", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_KEY", "OPENAI_MODEL", "OPENAI_MODEL_ID", "LLM_BASE_URL", "LLM_API_KEY", "DEFAULT_MODEL", "MODEL"].includes(key)) {
+        process.env[key] = String(value || "");
+      }
+    }
+  }
+}
+
+function resolveModelSetting(primaryKey, aliases = []) {
+  const keys = [primaryKey, ...aliases];
+  for (const key of keys) {
+    const value = String(process.env[key] || "").trim();
+    if (value) {
+      return value;
+    }
+  }
+  return "";
+}
+
 function loadModelConfig() {
-  const baseUrl = String(process.env.MODEL_BASE_URL || "").trim();
-  const apiKey = String(process.env.MODEL_API_KEY || "").trim();
-  const modelId = String(process.env.MODEL_ID || "").trim();
+  refreshModelEnvFromFiles();
+  const baseUrl = resolveModelSetting("MODEL_BASE_URL", ["OPENAI_BASE_URL", "OPENAI_API_BASE", "LLM_BASE_URL"]);
+  const apiKey = resolveModelSetting("MODEL_API_KEY", ["OPENAI_API_KEY", "LLM_API_KEY"]);
+  const modelId = resolveModelSetting("MODEL_ID", ["OPENAI_MODEL", "OPENAI_MODEL_ID", "DEFAULT_MODEL", "MODEL"]);
   if (!baseUrl || !apiKey || !modelId) {
-    throw new Error("MODEL_BASE_URL, MODEL_API_KEY, and MODEL_ID must be set in the template env file");
+    throw new Error("MODEL_BASE_URL, MODEL_API_KEY, and MODEL_ID must be set or inherited from current agent model config");
   }
   return { baseUrl: baseUrl.replace(/\/$/, ""), apiKey, modelId };
 }
@@ -1443,7 +1498,8 @@ async function executeRuntimeJudgment(state, judgment) {
   let deliberation;
   try {
     deliberation = await deliberateCommunityResponse(executionMessage, state, runtimeContext, judgment);
-  } catch {
+  } catch (error) {
+    console.error(JSON.stringify({ ok: false, deliberation_error: String(error?.message || error || "unknown deliberation error") }, null, 2));
     deliberation = {
       should_reply: false,
       reply_text: "",

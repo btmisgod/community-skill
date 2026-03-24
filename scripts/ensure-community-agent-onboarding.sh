@@ -139,6 +139,29 @@ quote_env_value() {
   printf "'%s'" "${value}"
 }
 
+first_non_empty() {
+  local value
+  for value in "$@"; do
+    if [[ -n "${value}" ]]; then
+      printf '%s' "${value}"
+      return
+    fi
+  done
+  printf '%s' ""
+}
+
+resolve_model_base_url() {
+  first_non_empty "${MODEL_BASE_URL:-}" "${OPENAI_BASE_URL:-}" "${OPENAI_API_BASE:-}" "${LLM_BASE_URL:-}"
+}
+
+resolve_model_api_key() {
+  first_non_empty "${MODEL_API_KEY:-}" "${OPENAI_API_KEY:-}" "${LLM_API_KEY:-}"
+}
+
+resolve_model_id() {
+  first_non_empty "${MODEL_ID:-}" "${OPENAI_MODEL:-}" "${OPENAI_MODEL_ID:-}" "${DEFAULT_MODEL:-}" "${MODEL:-}"
+}
+
 listener_pid_8848() {
   if command -v ss >/dev/null 2>&1; then
     ss -ltnp '( sport = :8848 )' 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1
@@ -300,6 +323,10 @@ print(data.get('release_ref', 'unknown'))
 PY
 )"
 
+RESOLVED_MODEL_BASE_URL="$(resolve_model_base_url)"
+RESOLVED_MODEL_API_KEY="$(resolve_model_api_key)"
+RESOLVED_MODEL_ID="$(resolve_model_id)"
+
 cat >"${ENV_FILE}" <<EOF
 COMMUNITY_BASE_URL=$(quote_env_value "${BASE_URL}")
 COMMUNITY_GROUP_SLUG=$(quote_env_value "${GROUP_SLUG}")
@@ -325,9 +352,9 @@ COMMUNITY_AGENT_BIO=$(quote_env_value "${COMMUNITY_AGENT_BIO:-}")
 COMMUNITY_AGENT_AVATAR_TEXT=$(quote_env_value "${COMMUNITY_AGENT_AVATAR_TEXT:-}")
 COMMUNITY_AGENT_ACCENT_COLOR=$(quote_env_value "${COMMUNITY_AGENT_ACCENT_COLOR:-}")
 COMMUNITY_AGENT_EXPERTISE=$(quote_env_value "${COMMUNITY_AGENT_EXPERTISE:-}")
-MODEL_BASE_URL=$(quote_env_value "${MODEL_BASE_URL:-}")
-MODEL_API_KEY=$(quote_env_value "${MODEL_API_KEY:-}")
-MODEL_ID=$(quote_env_value "${MODEL_ID:-}")
+MODEL_BASE_URL=$(quote_env_value "${RESOLVED_MODEL_BASE_URL}")
+MODEL_API_KEY=$(quote_env_value "${RESOLVED_MODEL_API_KEY}")
+MODEL_ID=$(quote_env_value "${RESOLVED_MODEL_ID}")
 EOF
 
 cat >"${BOOTSTRAP_METADATA}" <<EOF

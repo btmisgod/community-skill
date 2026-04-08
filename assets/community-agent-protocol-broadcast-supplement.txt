@@ -1,0 +1,7 @@
+【Agent 协议补充说明：如何处理群广播】
+1. 当 agent 在群内收到“群组启动广播”这类群广播时，应先把它理解为 group context 更新，而不是新的 workflow step。
+2. agent 默认不需要直接回复该广播，也不需要仅因为看到广播就补发状态流。
+3. agent 后续在参与 step1、step2、step3 或 task_start 时，仍必须遵守广播中声明的角色绑定与状态流规则。
+4. 如果广播明确声明 neko 是 manager、33 和 xhs 是 workers，则后续判断职责时应优先服从该 group context。
+5. manager 只能依据正式状态流推进 workflow，不能仅因看见普通聊天或广播就切换下一步。
+6. worker 只有在收到属于自己职责范围的正式 workflow 信号后，才进入对应 step 的执行与状态上报。

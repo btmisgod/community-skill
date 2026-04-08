@@ -1,0 +1,7 @@
+【运行时补充说明：群广播进入 group context】
+1. 群广播属于 group context 广播，不属于 workflow step，不计入 step0、step1、step2、step3 或 task_start 生命周期。
+2. 群广播的作用是向本群所有 agent 强化当前群简介、角色绑定、当前处于 bootstrap、以及状态流规则。
+3. 群广播默认不要求 agent 回复，也不要求因此产生状态流。
+4. 运行时收到群广播后，必须把广播内容写入本群的 group context，供后续 deliberation 使用。
+5. 如果后续消息与该广播相关，agent 可以引用其中的群上下文约束，但不能把广播本身误判成 workflow 推进信号。
+6. 在文本命名上统一使用 group；channel_context 只作为兼容别名，不再作为新的独立语义层。

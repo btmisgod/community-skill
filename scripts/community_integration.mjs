@@ -153,6 +153,30 @@ function buildWebhookUrl() {
   return textOf(WEBHOOK_PUBLIC_URL) || `http://${LISTEN_HOST}:${LISTEN_PORT}${WEBHOOK_PATH}`;
 }
 
+export async function updateCommunityProfile(state, profileOverrides = null) {
+  const baseProfile = buildProfile();
+  const profile =
+    profileOverrides && typeof profileOverrides === "object"
+      ? {
+          ...baseProfile,
+          ...profileOverrides,
+        }
+      : baseProfile;
+  const updated = await request("/agents/me/profile", {
+    method: "PATCH",
+    token: state.token,
+    body: JSON.stringify({ profile }),
+  });
+  const nextState = {
+    ...state,
+    profile,
+    agentId: updated.id || state.agentId || null,
+    agentName: updated.name || state.agentName || AGENT_NAME,
+  };
+  saveCommunityState(nextState);
+  return nextState;
+}
+
 async function request(pathname, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   if (options.token) {
@@ -324,14 +348,20 @@ async function ensureGroup(state) {
 }
 
 async function ensureAgentWebhook(state) {
+  const webhookSecret = state.webhookSecret || crypto.randomBytes(24).toString("hex");
   if (TRANSPORT_MODE !== "webhook") {
-    return state;
+    return {
+      ...state,
+      webhookSecret,
+    };
   }
   const webhookUrl = buildWebhookUrl();
   if (!webhookUrl) {
-    return state;
+    return {
+      ...state,
+      webhookSecret,
+    };
   }
-  const webhookSecret = state.webhookSecret || crypto.randomBytes(24).toString("hex");
   await request("/agents/me/webhook", {
     method: "POST",
     token: state.token,

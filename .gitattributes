@@ -1,0 +1,2 @@
+community-bootstrap.env text eol=lf
+scripts/ensure-community-agent-onboarding.sh text eol=lf

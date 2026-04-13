@@ -3,7 +3,7 @@ set -euo pipefail
 
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-/root/.openclaw/workspace}"
 SKILL_ROOT="${SKILL_ROOT:-${WORKSPACE_ROOT}/skills/CommunityIntegrationSkill}"
-TEMPLATE_HOME="${COMMUNITY_TEMPLATE_HOME:-${WORKSPACE_ROOT}/.openclaw/community-agent-template}"
+TEMPLATE_HOME="${COMMUNITY_STATE_HOME:-${COMMUNITY_TEMPLATE_HOME:-${WORKSPACE_ROOT}/.openclaw/community-skill}}"
 SOURCE_PROTOCOL="${SKILL_ROOT}/assets/AGENT_PROTOCOL.md"
 TARGET_PROTOCOL="${TEMPLATE_HOME}/assets/AGENT_PROTOCOL.md"
 

@@ -57,18 +57,18 @@ function extractPayload(event) {
 }
 
 function extractEventType(event) {
-  return textOf(event?.event?.event_type);
+  return textOf(event?.event?.event_type || event?.event_type);
 }
 
 function classifyInput(eventType, message) {
   if (eventType === "protocol_violation") {
     return { category: "protocol_violation", reason: "event_type" };
   }
-  if (eventType === "workflow_contract") {
-    return { category: "workflow_contract", reason: "event_type" };
-  }
   if (["group_context", "channel_context"].includes(eventType)) {
     return { category: "group_context", reason: "event_type" };
+  }
+  if (["group_protocol", "channel_protocol"].includes(eventType)) {
+    return { category: "group_protocol", reason: "event_type" };
   }
   if (message.flow_type === "status") {
     return { category: "status", reason: "status_flow" };
@@ -119,7 +119,7 @@ function decideObligation(category, signals) {
   if (category === "protocol_violation") {
     return { obligation: "observe_only", reason: "protocol_violation" };
   }
-  if (["workflow_contract", "group_context"].includes(category)) {
+  if (["group_context", "group_protocol"].includes(category)) {
     return { obligation: "observe_only", reason: "context_update" };
   }
   if (signals.status) {
@@ -150,19 +150,30 @@ function recommendHandling(category, obligation, signals) {
   return { mode: "observe_only", reason: "observe_only_default" };
 }
 
-function judgmentResult(category, message, signals, obligationDecision, recommendation, extras = {}) {
+function protocolMountOf(runtimeContext) {
+  const source = dictOf(runtimeContext);
+  return {
+    agent_protocol: source.agent_protocol || dictOf(source.protocol_mount).agent_protocol || null,
+    group_protocol: source.group_protocol || dictOf(source.protocol_mount).group_protocol || null,
+    group_context: source.group_context || dictOf(source.protocol_mount).group_context || null,
+    mounted_at: source.mounted_at || dictOf(source.protocol_mount).mounted_at || null,
+  };
+}
+
+function judgmentResult(category, message, signals, obligationDecision, recommendation, runtimeContext = {}, extras = {}) {
   return {
     category,
     message,
     signals,
     obligation: obligationDecision,
     recommendation,
+    protocol_mount: protocolMountOf(runtimeContext),
     observed: recommendation.mode === "observe_only",
     ...extras,
   };
 }
 
-export async function handleRuntimeEvent(adapter, state, event) {
+export async function handleRuntimeEvent(adapter, state, event, runtimeContext = {}) {
   const eventType = extractEventType(event);
   const payload = extractPayload(event);
   const message = normalizeMessage(payload);
@@ -175,14 +186,7 @@ export async function handleRuntimeEvent(adapter, state, event) {
     if (typeof adapter.handleProtocolViolation === "function") {
       await adapter.handleProtocolViolation(state, payload);
     }
-    return judgmentResult(classification.category, message, signals, obligationDecision, recommendation);
-  }
-
-  if (classification.category === "workflow_contract") {
-    if (typeof adapter.loadWorkflowContract === "function" && message.group_id) {
-      await adapter.loadWorkflowContract(message.group_id, payload, "event");
-    }
-    return judgmentResult(classification.category, message, signals, obligationDecision, recommendation);
+    return judgmentResult(classification.category, message, signals, obligationDecision, recommendation, runtimeContext);
   }
 
   if (classification.category === "group_context") {
@@ -191,8 +195,15 @@ export async function handleRuntimeEvent(adapter, state, event) {
     } else if (typeof adapter.loadChannelContext === "function" && message.group_id) {
       await adapter.loadChannelContext(state, message.group_id, payload);
     }
-    return judgmentResult(classification.category, message, signals, obligationDecision, recommendation);
+    return judgmentResult(classification.category, message, signals, obligationDecision, recommendation, runtimeContext);
   }
 
-  return judgmentResult(classification.category, message, signals, obligationDecision, recommendation);
+  if (classification.category === "group_protocol") {
+    if (typeof adapter.loadGroupProtocol === "function" && message.group_id) {
+      await adapter.loadGroupProtocol(state, message.group_id, payload);
+    }
+    return judgmentResult(classification.category, message, signals, obligationDecision, recommendation, runtimeContext);
+  }
+
+  return judgmentResult(classification.category, message, signals, obligationDecision, recommendation, runtimeContext);
 }

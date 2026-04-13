@@ -1,0 +1,209 @@
+{
+  "TaskId": "20260413-audit-workstream-b-skill-and-runtime-v1",
+  "Workstream": "B",
+  "Role": "AuditThreadB",
+  "GeneratedAt": "2026-04-13",
+  "Repository": "community-skill",
+  "Status": "completed",
+  "Objective": "Audit and repair community-skill so that onboarding, runtime boundary, protocol mounting, and skill-side message-envelope packaging align with the current design truths within workstream B scope.",
+  "Scope": [
+    "community-skill onboarding",
+    "runtime minimum-duty judgment",
+    "agent protocol mounting",
+    "group protocol mounting",
+    "skill-side message-envelope packaging",
+    "skill outbound behavior",
+    "skill release-surface cleanup"
+  ],
+  "ProblemsFound": [
+    {
+      "id": "B-01",
+      "title": "skill 依赖了不存在的 session sync 接口",
+      "impact": "onboarding 和 session 同步路径不再对应 myproject 的真实接口，skill 运行时会建立在假合同之上。",
+      "fix": "移除 /agents/me/session/sync 依赖，改为通过 /protocol/context、/groups/{id}/protocol、/groups/{id}/context 执行协议挂载与上下文刷新；同时不再在 skill 侧自动创建默认群。"
+    },
+    {
+      "id": "B-02",
+      "title": "runtime 和 skill 边界越权",
+      "impact": "receiveCommunityEvent 会在 judgment 后直接自动发消息，runtime 被写成了半个编排器，不符合最小责任边界。",
+      "fix": "保留 runtime judgment only，receiveCommunityEvent 仅返回 judgment 和 mounted protocol context，不再自动回帖。"
+    },
+    {
+      "id": "B-03",
+      "title": "消息封装真相链断裂",
+      "impact": "SKILL.md 宣称存在统一消息封装能力，但主实现和测试未对齐，skill-side message-envelope packaging 不能作为稳定真相面。",
+      "fix": "补齐 buildCommunityMessage 和 buildDirectedCollaborationMessage 的主路径，统一由 sendCommunityMessage 出站；保留 context_block 和 status_block 的 skill-side envelope 包装。"
+    },
+    {
+      "id": "B-04",
+      "title": "release 面受到旧模板和具体环境污染",
+      "impact": "旧 state 路径、旧 workflow 残留、Windows 专属 git 路径和多余默认值会误导安装和维护。",
+      "fix": "将主 state 路径切到 .openclaw/community-skill，旧目录仅保留兼容 fallback；移除不必要的 bootstrap host/port 默认值；修复 CLI 中 startswith 拼写错误和 git 路径硬编码。"
+    }
+  ],
+  "RootCausePerProblem": [
+    {
+      "problem_id": "B-01",
+      "root_cause": "community-skill 仍在使用旧 session 合同和旧 bootstrap 逻辑，没有完全对齐 myproject 当前实际提供的接口面。"
+    },
+    {
+      "problem_id": "B-02",
+      "root_cause": "历史实现把 runtime judgment 和 skill outbound 混在一起，导致 runtime 职责边界被扩大。"
+    },
+    {
+      "problem_id": "B-03",
+      "root_cause": "文档、导出能力、测试和主实现长期漂移，统一消息基型封装只停留在口头层面。"
+    },
+    {
+      "problem_id": "B-04",
+      "root_cause": "模板时代的目录命名、环境假设和运维脚本直接泄漏进正式 skill 仓的 release surface。"
+    }
+  ],
+  "FilesChanged": [
+    {
+      "path": "E:\\ocdex\\agents community\\community-skill\\scripts\\community_integration.mjs",
+      "role": "主修复文件",
+      "summary": [
+        "切换到真实存在的协议和上下文接口",
+        "补齐 agent/group protocol mounting",
+        "保留 skill-side message-envelope packaging",
+        "移除自动回帖逻辑"
+      ]
+    },
+    {
+      "path": "E:\\ocdex\\agents community\\community-skill\\assets\\community-runtime-v0.mjs",
+      "role": "runtime 边界修复",
+      "summary": [
+        "runtime 只做分类、最小责任判断和协议挂载结果透传",
+        "移除 workflow_contract 主路径",
+        "增加 group_protocol 事件处理"
+      ]
+    },
+    {
+      "path": "E:\\ocdex\\agents community\\community-skill\\scripts\\community-agent-cli.mjs",
+      "role": "CLI 和本地状态路径修复",
+      "summary": [
+        "主状态目录切换到 .openclaw/community-skill",
+        "保留 legacy fallback 兼容旧目录",
+        "修复 release ref bug",
+        "去掉 Windows 专属 git 路径硬编码"
+      ]
+    },
+    {
+      "path": "E:\\ocdex\\agents community\\community-skill\\scripts\\ensure-community-agent-onboarding.sh",
+      "role": "onboarding 路径修复",
+      "summary": [
+        "优先使用 COMMUNITY_STATE_HOME 和 .openclaw/community-skill",
+        "继续兼容旧 COMMUNITY_TEMPLATE_HOME",
+        "写回新的 state home 环境变量"
+      ]
+    },
+    {
+      "path": "E:\\ocdex\\agents community\\community-skill\\scripts\\install-runtime.sh",
+      "role": "runtime 安装路径修复",
+      "summary": [
+        "runtime 资产安装到 skill state assets"
+      ]
+    },
+    {
+      "path": "E:\\ocdex\\agents community\\community-skill\\scripts\\install-agent-protocol.sh",
+      "role": "protocol 资产安装路径修复",
+      "summary": [
+        "优先使用 COMMUNITY_STATE_HOME"
+      ]
+    },
+    {
+      "path": "E:\\ocdex\\agents community\\community-skill\\community-bootstrap.env",
+      "role": "release-surface cleanup",
+      "summary": [
+        "只保留允许存在的社区服务地址和默认 public 入口群",
+        "移除多余 host/port 明确默认值"
+      ]
+    },
+    {
+      "path": "E:\\ocdex\\agents community\\community-skill\\SKILL.md",
+      "role": "skill 真相面文档修复",
+      "summary": [
+        "改成 agent/group protocol mounting 口径",
+        "删除 workflow_contract 主表述"
+      ]
+    },
+    {
+      "path": "E:\\ocdex\\agents community\\community-skill\\README.md",
+      "role": "英文说明修复",
+      "summary": [
+        "同步新的状态目录、runtime 边界和协议挂载说明"
+      ]
+    },
+    {
+      "path": "E:\\ocdex\\agents community\\community-skill\\README.zh-CN.md",
+      "role": "中文说明修复",
+      "summary": [
+        "同步新的状态目录、runtime 边界和协议挂载说明"
+      ]
+    },
+    {
+      "path": "E:\\ocdex\\agents community\\community-skill\\tests\\community-runtime-message-protocol-v2.test.mjs",
+      "role": "runtime 验证",
+      "summary": [
+        "验证最小责任判断",
+        "验证 protocol mount 结果透传",
+        "验证 group_context/group_protocol/protocol_violation 分支"
+      ]
+    },
+    {
+      "path": "E:\\ocdex\\agents community\\community-skill\\tests\\community-skill-outbound-v2.test.mjs",
+      "role": "integration 验证",
+      "summary": [
+        "验证 build/send canonical message",
+        "验证 skill-side message-envelope packaging",
+        "验证 connectToCommunity 不再调用 session sync",
+        "验证 receiveCommunityEvent 不再自动发帖"
+      ]
+    }
+  ],
+  "Validation": {
+    "tests": [
+      {
+        "command": "node --test tests/*.test.mjs",
+        "result": "passed",
+        "details": "12/12 passed"
+      }
+    ],
+    "syntax_checks": [
+      {
+        "command": "node --check scripts/community_integration.mjs",
+        "result": "passed"
+      },
+      {
+        "command": "node --check assets/community-runtime-v0.mjs",
+        "result": "passed"
+      },
+      {
+        "command": "node --check scripts/community-agent-cli.mjs",
+        "result": "passed"
+      }
+    ],
+    "cli_checks": [
+      {
+        "command": "node scripts/community-agent-cli.mjs version",
+        "result": "passed"
+      },
+      {
+        "command": "node scripts/community-agent-cli.mjs status",
+        "result": "passed"
+      }
+    ]
+  },
+  "RemainingBlockers": [],
+  "DesignMismatchesStillOpen": [
+    {
+      "type": "compatibility_residue",
+      "detail": "保留了 community-agent-template 旧目录名的 fallback 兼容逻辑，但它已不再是主路径，也不再作为主真相源。"
+    }
+  ],
+  "DoneOrNextStep": {
+    "state": "done",
+    "next_step": "如需继续，建议进入 workstream C，用 fresh 安装面和 live 运行面对这次 B 修复进行环境级验证。"
+  }
+}

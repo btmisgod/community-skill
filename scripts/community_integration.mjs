@@ -9,56 +9,6 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const SKILL_HOME = path.resolve(__dirname, "..");
 
-const WORKSPACE = process.env.WORKSPACE_ROOT || "G:/community agnts/community agents";
-const TEMPLATE_HOME = process.env.COMMUNITY_TEMPLATE_HOME || path.join(WORKSPACE, "community-skill");
-const STATE_ROOT = path.join(TEMPLATE_HOME, "state");
-const BASE_URL = process.env.COMMUNITY_BASE_URL || "http://127.0.0.1:8000/api/v1";
-const GROUP_SLUG = process.env.COMMUNITY_GROUP_SLUG || "public-lobby";
-const AGENT_NAME = process.env.COMMUNITY_AGENT_NAME || `community-agent-${os.hostname()}`;
-const AGENT_DESCRIPTION = process.env.COMMUNITY_AGENT_DESCRIPTION || "Community protocol installed agent";
-const AGENT_HANDLE = process.env.COMMUNITY_AGENT_HANDLE || AGENT_NAME;
-const TRANSPORT_MODE = process.env.COMMUNITY_TRANSPORT || "webhook";
-const LISTEN_HOST = process.env.COMMUNITY_WEBHOOK_HOST || "127.0.0.1";
-const LISTEN_PORT = Number(process.env.COMMUNITY_WEBHOOK_PORT || "8848");
-const SOCKET_PATH = process.env.COMMUNITY_AGENT_SOCKET_PATH || "";
-const WEBHOOK_PATH = process.env.COMMUNITY_WEBHOOK_PATH || `/webhook/${slugifyHandle(AGENT_HANDLE)}`;
-const SEND_PATH = process.env.COMMUNITY_SEND_PATH || `/send/${slugifyHandle(AGENT_HANDLE)}`;
-const WEBHOOK_PUBLIC_URL = process.env.COMMUNITY_WEBHOOK_PUBLIC_URL || "";
-const COMMUNITY_PROTOCOL_VERSION = "ACP-003";
-const RUNTIME_VERSION = "community-runtime-v2";
-const SKILL_VERSION = "community-skill-v2";
-const ONBOARDING_VERSION = "community-onboarding-v2";
-const COMMUNITY_SKILL_CHANNEL = "community-skill-v1";
-const COMMUNITY_SKILL_SOURCE = "CommunityIntegrationSkill";
-
-const STATE_PATH = path.join(STATE_ROOT, "community-webhook-state.json");
-const GROUP_SESSIONS_PATH = path.join(STATE_ROOT, "community-group-sessions.json");
-const GROUP_CONTEXTS_PATH = path.join(STATE_ROOT, "community-group-contexts.json");
-const BUNDLED_RUNTIME_PATH = path.join(SKILL_HOME, "assets", "community-runtime-v0.mjs");
-const WORKSPACE_RUNTIME_PATH = path.join(WORKSPACE, "community-skill", "assets", "community-runtime-v0.mjs");
-const BUNDLED_AGENT_PROTOCOL_PATH = path.join(SKILL_HOME, "assets", "AGENT_PROTOCOL.md");
-const INSTALLED_AGENT_PROTOCOL_PATH = path.join(STATE_ROOT, "AGENT_PROTOCOL.md");
-
-let runtimeModulePromise = null;
-let runtimeModuleLoadedFrom = null;
-
-function ensureDir(filePath) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-}
-
-function loadJson(filePath, fallback = null) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
-  } catch {
-    return fallback;
-  }
-}
-
-function saveJson(filePath, value) {
-  ensureDir(filePath);
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
-}
-
 function dictOf(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
@@ -81,6 +31,31 @@ function firstText(...values) {
   return "";
 }
 
+function ensureDir(filePath) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+}
+
+function loadJson(filePath, fallback = null) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function saveJson(filePath, value) {
+  ensureDir(filePath);
+  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function appendJsonRecord(filePath, value, limit = 100) {
+  const current = loadJson(filePath, []);
+  const next = Array.isArray(current) ? current : [];
+  next.unshift(value);
+  saveJson(filePath, next.slice(0, limit));
+  return value;
+}
+
 function slugifyHandle(value) {
   const base = String(value || "")
     .trim()
@@ -90,32 +65,68 @@ function slugifyHandle(value) {
   return base || `agent-${Date.now().toString().slice(-6)}`;
 }
 
-function cleanupStaleSocket(socketPath) {
-  const normalizedPath = textOf(socketPath);
-  if (!normalizedPath || normalizedPath.startsWith("\\\\")) {
-    return normalizedPath;
+function resolveWorkspaceRoot() {
+  if (textOf(process.env.WORKSPACE_ROOT)) {
+    return path.resolve(process.env.WORKSPACE_ROOT);
   }
-  ensureDir(normalizedPath);
-  if (!fs.existsSync(normalizedPath)) {
-    return normalizedPath;
+  if (path.basename(path.dirname(SKILL_HOME)) === "skills") {
+    return path.resolve(SKILL_HOME, "..", "..");
   }
-  try {
-    fs.rmSync(normalizedPath, { force: true });
-  } catch (error) {
-    throw new Error(`failed to remove stale socket at ${normalizedPath}: ${error.message}`);
-  }
-  return normalizedPath;
+  return path.resolve(SKILL_HOME);
 }
 
-function normalizeFlowType(value) {
-  const flowType = firstText(value).toLowerCase() || "run";
-  if (flowType === "status") {
-    return "run";
+function resolveStateHome(workspaceRoot) {
+  const explicit = firstText(process.env.COMMUNITY_STATE_HOME, process.env.COMMUNITY_TEMPLATE_HOME);
+  if (explicit) {
+    return path.resolve(explicit);
   }
-  return ["start", "run", "result"].includes(flowType) ? flowType : "run";
+  const preferred = path.join(workspaceRoot, ".openclaw", "community-skill");
+  const legacy = path.join(workspaceRoot, ".openclaw", "community-agent-template");
+  if (fs.existsSync(preferred)) {
+    return preferred;
+  }
+  if (fs.existsSync(legacy)) {
+    return legacy;
+  }
+  return preferred;
 }
+
+const WORKSPACE = resolveWorkspaceRoot();
+const STATE_HOME = resolveStateHome(WORKSPACE);
+const STATE_ROOT = path.join(STATE_HOME, "state");
+const BASE_URL = textOf(process.env.COMMUNITY_BASE_URL);
+const GROUP_SLUG = textOf(process.env.COMMUNITY_GROUP_SLUG) || "public-lobby";
+const AGENT_NAME = textOf(process.env.COMMUNITY_AGENT_NAME) || `community-agent-${os.hostname()}`;
+const AGENT_DESCRIPTION = textOf(process.env.COMMUNITY_AGENT_DESCRIPTION) || "Community protocol installed agent";
+const AGENT_HANDLE = textOf(process.env.COMMUNITY_AGENT_HANDLE) || AGENT_NAME;
+const TRANSPORT_MODE = textOf(process.env.COMMUNITY_TRANSPORT) || "webhook";
+const LISTEN_HOST = textOf(process.env.COMMUNITY_WEBHOOK_HOST) || "127.0.0.1";
+const LISTEN_PORT = Number(process.env.COMMUNITY_WEBHOOK_PORT || "8848");
+const SOCKET_PATH = textOf(process.env.COMMUNITY_AGENT_SOCKET_PATH);
+const WEBHOOK_PATH = textOf(process.env.COMMUNITY_WEBHOOK_PATH) || `/webhook/${slugifyHandle(AGENT_HANDLE)}`;
+const SEND_PATH = textOf(process.env.COMMUNITY_SEND_PATH) || `/send/${slugifyHandle(AGENT_HANDLE)}`;
+const WEBHOOK_PUBLIC_URL = textOf(process.env.COMMUNITY_WEBHOOK_PUBLIC_URL);
+const COMMUNITY_PROTOCOL_VERSION = "ACP-003";
+const RUNTIME_VERSION = "community-runtime-v2";
+const SKILL_VERSION = "community-skill-v2";
+const ONBOARDING_VERSION = "community-onboarding-v2";
+const COMMUNITY_SKILL_CHANNEL = "community-skill-v1";
+const COMMUNITY_SKILL_SOURCE = "CommunityIntegrationSkill";
+
+const STATE_PATH = path.join(STATE_ROOT, "community-webhook-state.json");
+const GROUP_CONTEXTS_PATH = path.join(STATE_ROOT, "community-group-contexts.json");
+const GROUP_PROTOCOLS_PATH = path.join(STATE_ROOT, "community-group-protocols.json");
+const AGENT_PROTOCOLS_PATH = path.join(STATE_ROOT, "community-agent-protocols.json");
+const PROTOCOL_VIOLATIONS_PATH = path.join(STATE_ROOT, "community-protocol-violations.json");
+const BUNDLED_RUNTIME_PATH = path.join(SKILL_HOME, "assets", "community-runtime-v0.mjs");
+const INSTALLED_RUNTIME_PATH = path.join(STATE_HOME, "assets", "community-runtime-v0.mjs");
+const BUNDLED_AGENT_PROTOCOL_PATH = path.join(SKILL_HOME, "assets", "AGENT_PROTOCOL.md");
+const INSTALLED_AGENT_PROTOCOL_PATH = path.join(STATE_HOME, "assets", "AGENT_PROTOCOL.md");
 
 const CANONICAL_UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
+
+let runtimeModulePromise = null;
+let runtimeModuleLoadedFrom = null;
 
 function parseCanonicalUuid(value) {
   const text = firstText(value);
@@ -132,9 +143,29 @@ function firstCanonicalUuid(...values) {
   return null;
 }
 
+function normalizeFlowType(value) {
+  const flowType = firstText(value).toLowerCase() || "run";
+  if (flowType === "status") {
+    return "run";
+  }
+  return ["start", "run", "result"].includes(flowType) ? flowType : "run";
+}
+
+function ensureBaseUrl() {
+  if (!BASE_URL) {
+    throw new Error("COMMUNITY_BASE_URL is required. Set it in community-bootstrap.env or the current environment.");
+  }
+  return BASE_URL;
+}
+
 function isAuthFailure(error) {
   const message = String(error?.message || "").toLowerCase();
-  return message.includes("unauthorized") || message.includes("invalid token") || message.includes("not authenticated") || message.includes("token");
+  return (
+    message.includes("unauthorized") ||
+    message.includes("invalid token") ||
+    message.includes("not authenticated") ||
+    message.includes("token")
+  );
 }
 
 function buildProfile() {
@@ -149,8 +180,202 @@ function buildProfile() {
   };
 }
 
+function isLoopbackHost(value) {
+  return ["0.0.0.0", "127.0.0.1", "localhost", "::1"].includes(textOf(value).toLowerCase());
+}
+
 function buildWebhookUrl() {
-  return textOf(WEBHOOK_PUBLIC_URL) || `http://${LISTEN_HOST}:${LISTEN_PORT}${WEBHOOK_PATH}`;
+  if (WEBHOOK_PUBLIC_URL) {
+    return WEBHOOK_PUBLIC_URL;
+  }
+  if (!LISTEN_HOST || isLoopbackHost(LISTEN_HOST)) {
+    return "";
+  }
+  return `http://${LISTEN_HOST}:${LISTEN_PORT}${WEBHOOK_PATH}`;
+}
+
+function persistByGroup(filePath, key, valueKey, records) {
+  const current = loadJson(filePath, {}) || {};
+  for (const item of listOf(records)) {
+    const groupId = firstText(item?.[key]);
+    if (!groupId) {
+      continue;
+    }
+    current[groupId] = {
+      ...dictOf(current[groupId]),
+      ...dictOf(item),
+      [valueKey]: item?.[valueKey] ?? dictOf(current[groupId])[valueKey] ?? null,
+    };
+  }
+  saveJson(filePath, current);
+  return current;
+}
+
+function persistGroupContexts(updates) {
+  return persistByGroup(GROUP_CONTEXTS_PATH, "group_id", "group_context", updates);
+}
+
+function persistGroupProtocols(updates) {
+  return persistByGroup(GROUP_PROTOCOLS_PATH, "group_id", "group_protocol", updates);
+}
+
+function persistAgentProtocols(updates) {
+  return persistByGroup(AGENT_PROTOCOLS_PATH, "group_id", "agent_protocol", updates);
+}
+
+function removePersistedGroupArtifacts(groupIds) {
+  const removedIds = new Set(
+    listOf(groupIds)
+      .map((item) => (typeof item === "string" ? item : firstText(item?.group_id, item?.id)))
+      .filter(Boolean),
+  );
+  if (!removedIds.size) {
+    return;
+  }
+
+  for (const filePath of [GROUP_CONTEXTS_PATH, GROUP_PROTOCOLS_PATH, AGENT_PROTOCOLS_PATH]) {
+    const current = loadJson(filePath, {}) || {};
+    const next = Object.fromEntries(Object.entries(current).filter(([groupId]) => !removedIds.has(groupId)));
+    saveJson(filePath, next);
+  }
+}
+
+function currentVersionMap(filePath, versionKey) {
+  const current = loadJson(filePath, {}) || {};
+  return Object.fromEntries(
+    Object.entries(current)
+      .filter(([, value]) => value && typeof value === "object")
+      .map(([groupId, value]) => [groupId, textOf(value[versionKey])])
+      .filter(([, value]) => value),
+  );
+}
+
+function runtimeContextFor(groupId) {
+  const normalizedGroupId = firstText(groupId);
+  const groupContexts = loadJson(GROUP_CONTEXTS_PATH, {}) || {};
+  const groupProtocols = loadJson(GROUP_PROTOCOLS_PATH, {}) || {};
+  const agentProtocols = loadJson(AGENT_PROTOCOLS_PATH, {}) || {};
+  return {
+    group_context: dictOf(groupContexts[normalizedGroupId]).group_context || null,
+    group_context_version: dictOf(groupContexts[normalizedGroupId]).group_context_version || null,
+    group_protocol: dictOf(groupProtocols[normalizedGroupId]).group_protocol || null,
+    group_protocol_version: dictOf(groupProtocols[normalizedGroupId]).group_protocol_version || null,
+    agent_protocol: dictOf(agentProtocols[normalizedGroupId]).agent_protocol || null,
+    agent_protocol_version: dictOf(agentProtocols[normalizedGroupId]).agent_protocol_version || null,
+  };
+}
+
+async function request(pathname, options = {}) {
+  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+  if (options.token) {
+    headers["X-Agent-Token"] = options.token;
+  }
+  const response = await fetch(`${ensureBaseUrl()}${pathname}`, {
+    ...options,
+    headers,
+    body: options.body,
+  });
+  const text = await response.text();
+  let payload = {};
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      throw new Error(`Non-JSON response from ${pathname}: ${text}`);
+    }
+  }
+  if (!response.ok || payload.success === false) {
+    throw new Error(`Request failed for ${pathname}: ${payload.message || response.status}`);
+  }
+  return payload.data;
+}
+
+export async function listCommunityMessages(state, options = {}) {
+  const groupId = firstText(options.groupId, state?.groupId);
+  if (!groupId) {
+    throw new Error("listCommunityMessages requires group_id");
+  }
+  const limit = Number(options.limit || 100);
+  const offset = Number(options.offset || 0);
+  return request(`/messages?group_id=${encodeURIComponent(groupId)}&limit=${limit}&offset=${offset}`, {
+    method: "GET",
+    token: state?.token,
+  });
+}
+
+export async function verifyCanonicalMessageVisible(state, options = {}) {
+  const groupId = firstText(options.groupId, state?.groupId);
+  const messageId = firstCanonicalUuid(options.messageId);
+  const idempotencyKey = firstText(options.idempotencyKey, options.clientRequestId);
+  const expectedText = firstText(options.text);
+  const attempts = Number(options.attempts || 20);
+  const delayMs = Number(options.delayMs || 500);
+
+  if (!groupId) {
+    throw new Error("verifyCanonicalMessageVisible requires group_id");
+  }
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const response = await listCommunityMessages(state, {
+      groupId,
+      limit: Number(options.limit || 100),
+      offset: 0,
+    });
+    const matched = listOf(response?.items).find((item) => {
+      if (!item || typeof item !== "object") {
+        return false;
+      }
+      if (messageId && textOf(item.id) === messageId) {
+        return true;
+      }
+      const extensions = dictOf(item.extensions);
+      const custom = dictOf(extensions.custom);
+      const requestIds = [
+        extensions.client_request_id,
+        extensions.outbound_correlation_id,
+        custom.idempotency_key,
+      ]
+        .map((value) => textOf(value))
+        .filter(Boolean);
+      if (idempotencyKey && requestIds.includes(idempotencyKey)) {
+        return true;
+      }
+      return expectedText && textOf(dictOf(item.content).text) === expectedText;
+    });
+    if (matched) {
+      return {
+        ok: true,
+        attempts: attempt,
+        message: matched,
+      };
+    }
+    if (attempt < attempts) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  throw new Error(`canonical effect not observed for group ${groupId}`);
+}
+
+export function loadSavedCommunityState() {
+  return loadJson(STATE_PATH, {}) || {};
+}
+
+export function saveCommunityState(state) {
+  saveJson(STATE_PATH, state || {});
+  return state || {};
+}
+
+export function installRuntime() {
+  ensureDir(INSTALLED_RUNTIME_PATH);
+  fs.writeFileSync(INSTALLED_RUNTIME_PATH, fs.readFileSync(BUNDLED_RUNTIME_PATH, "utf8"));
+  return INSTALLED_RUNTIME_PATH;
+}
+
+export function installAgentProtocol() {
+  ensureDir(INSTALLED_AGENT_PROTOCOL_PATH);
+  fs.writeFileSync(INSTALLED_AGENT_PROTOCOL_PATH, fs.readFileSync(BUNDLED_AGENT_PROTOCOL_PATH, "utf8"));
+  return INSTALLED_AGENT_PROTOCOL_PATH;
 }
 
 export async function updateCommunityProfile(state, profileOverrides = null) {
@@ -177,107 +402,11 @@ export async function updateCommunityProfile(state, profileOverrides = null) {
   return nextState;
 }
 
-async function request(pathname, options = {}) {
-  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
-  if (options.token) {
-    headers["X-Agent-Token"] = options.token;
-  }
-  const response = await fetch(`${BASE_URL}${pathname}`, {
-    ...options,
-    headers,
-    body: options.body,
-  });
-  const text = await response.text();
-  let payload = {};
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      throw new Error(`Non-JSON response from ${pathname}: ${text}`);
-    }
-  }
-  if (!response.ok || payload.success === false) {
-    throw new Error(`Request failed for ${pathname}: ${payload.message || response.status}`);
-  }
-  return payload.data;
-}
-
-function persistGroupSessions(declarations) {
-  const current = loadJson(GROUP_SESSIONS_PATH, {}) || {};
-  for (const item of listOf(declarations)) {
-    if (!item?.group_id) {
-      continue;
-    }
-    current[item.group_id] = item;
-  }
-  saveJson(GROUP_SESSIONS_PATH, current);
-  return current;
-}
-
-function persistGroupContexts(updates) {
-  const current = loadJson(GROUP_CONTEXTS_PATH, {}) || {};
-  for (const item of listOf(updates)) {
-    if (!item?.group_id) {
-      continue;
-    }
-    current[item.group_id] = item;
-  }
-  saveJson(GROUP_CONTEXTS_PATH, current);
-  return current;
-}
-
-function removeGroupCacheEntries(groupIds) {
-  const removedIds = new Set(listOf(groupIds).map((item) => textOf(item)).filter(Boolean));
-  if (!removedIds.size) {
-    return;
-  }
-
-  const sessions = loadJson(GROUP_SESSIONS_PATH, {}) || {};
-  const contexts = loadJson(GROUP_CONTEXTS_PATH, {}) || {};
-  const nextSessions = Object.fromEntries(Object.entries(sessions).filter(([groupId]) => !removedIds.has(textOf(groupId))));
-  const nextContexts = Object.fromEntries(Object.entries(contexts).filter(([groupId]) => !removedIds.has(textOf(groupId))));
-  saveJson(GROUP_SESSIONS_PATH, nextSessions);
-  saveJson(GROUP_CONTEXTS_PATH, nextContexts);
-}
-
-function currentVersionMap(storePath, versionKey) {
-  const current = loadJson(storePath, {}) || {};
-  return Object.fromEntries(
-    Object.entries(current)
-      .filter(([, value]) => value && typeof value === "object")
-      .map(([groupId, value]) => [groupId, textOf(value[versionKey])])
-      .filter(([, value]) => value),
-  );
-}
-
-export function loadSavedCommunityState() {
-  return loadJson(STATE_PATH, {}) || {};
-}
-
-export function saveCommunityState(state) {
-  saveJson(STATE_PATH, state || {});
-  return state || {};
-}
-
-export function installRuntime() {
-  const targetPath = fs.existsSync(WORKSPACE_RUNTIME_PATH) ? WORKSPACE_RUNTIME_PATH : BUNDLED_RUNTIME_PATH;
-  ensureDir(targetPath);
-  const source = fs.readFileSync(BUNDLED_RUNTIME_PATH, "utf8");
-  fs.writeFileSync(targetPath, source);
-  return targetPath;
-}
-
-export function installAgentProtocol() {
-  ensureDir(INSTALLED_AGENT_PROTOCOL_PATH);
-  fs.writeFileSync(INSTALLED_AGENT_PROTOCOL_PATH, fs.readFileSync(BUNDLED_AGENT_PROTOCOL_PATH, "utf8"));
-  return INSTALLED_AGENT_PROTOCOL_PATH;
-}
-
 async function ensureAgent(state) {
   if (state?.token) {
     try {
       const me = await request("/agents/me", { token: state.token, method: "GET" });
-      return { ...state, agentId: me.id, agentName: me.name };
+      return { ...state, agentId: me.id, agentName: me.name, profile: me.metadata_json?.profile || state.profile || null };
     } catch (error) {
       if (!isAuthFailure(error)) {
         throw error;
@@ -313,53 +442,33 @@ async function ensureAgent(state) {
 }
 
 async function ensureGroup(state) {
+  let group;
   try {
-    const group = await request(`/groups/by-slug/${GROUP_SLUG}`, { token: state.token });
-    await request(`/groups/by-slug/${GROUP_SLUG}/join`, {
-      method: "POST",
-      token: state.token,
-      body: JSON.stringify({}),
-    });
-    return {
-      ...state,
-      groupId: group.id,
-      groupSlug: group.slug,
-      groupName: group.name,
-    };
-  } catch {
-    const created = await request("/groups", {
-      method: "POST",
-      token: state.token,
-      body: JSON.stringify({
-        name: "Public Lobby",
-        slug: GROUP_SLUG,
-        description: "Community default lobby",
-        group_type: "public_lobby",
-        metadata_json: {},
-      }),
-    });
-    return {
-      ...state,
-      groupId: created.id,
-      groupSlug: created.slug,
-      groupName: created.name,
-    };
+    group = await request(`/groups/by-slug/${GROUP_SLUG}`, { token: state.token, method: "GET" });
+  } catch (error) {
+    throw new Error(`community entry group is unavailable (${GROUP_SLUG}): ${error.message}`);
   }
+  await request(`/groups/by-slug/${GROUP_SLUG}/join`, {
+    method: "POST",
+    token: state.token,
+    body: JSON.stringify({}),
+  });
+  return {
+    ...state,
+    groupId: group.id,
+    groupSlug: group.slug,
+    groupName: group.name,
+  };
 }
 
 async function ensureAgentWebhook(state) {
   const webhookSecret = state.webhookSecret || crypto.randomBytes(24).toString("hex");
-  if (TRANSPORT_MODE !== "webhook") {
-    return {
-      ...state,
-      webhookSecret,
-    };
-  }
   const webhookUrl = buildWebhookUrl();
   if (!webhookUrl) {
     return {
       ...state,
       webhookSecret,
+      webhookUrl: state.webhookUrl || null,
     };
   }
   await request("/agents/me/webhook", {
@@ -368,7 +477,7 @@ async function ensureAgentWebhook(state) {
     body: JSON.stringify({
       target_url: webhookUrl,
       secret: webhookSecret,
-      description: "community-skill-v2 session/sync webhook",
+      description: `community-skill-v2 ${TRANSPORT_MODE} ingress webhook`,
     }),
   });
   return {
@@ -378,42 +487,171 @@ async function ensureAgentWebhook(state) {
   };
 }
 
-export async function syncCommunitySession(state, options = {}) {
-  const payload = {
-    agent_id: state.agentId || null,
-    agent_session_id: state.agentSessionId || null,
-    community_protocol_version: COMMUNITY_PROTOCOL_VERSION,
-    runtime_version: RUNTIME_VERSION,
-    skill_version: SKILL_VERSION,
-    onboarding_version: ONBOARDING_VERSION,
-    group_session_versions: currentVersionMap(GROUP_SESSIONS_PATH, "group_session_version"),
-    group_context_versions: currentVersionMap(GROUP_CONTEXTS_PATH, "group_context_version"),
-    full_sync_requested: Boolean(options.fullSyncRequested || !state.agentSessionId),
-  };
-  const result = await request("/agents/me/session/sync", {
+function resolveProtocolActionType(event) {
+  const eventType = firstText(event?.event?.event_type, event?.event_type);
+  if (eventType === "message.posted") {
+    return "message.process_unread";
+  }
+  if (eventType === "protocol_violation") {
+    return "message.process_unread";
+  }
+  if (eventType === "group_context") {
+    return "community.connect";
+  }
+  return "community.connect";
+}
+
+async function fetchAgentProtocolContext(state, groupId, options = {}) {
+  return request("/protocol/context", {
     method: "POST",
     token: state.token,
-    body: JSON.stringify(payload),
+    body: JSON.stringify({
+      group_id: groupId,
+      action_type: firstText(options.actionType, "community.connect"),
+      trigger: firstText(options.trigger, null) || null,
+      resource_id: parseCanonicalUuid(options.resourceId),
+      metadata: dictOf(options.metadata),
+    }),
   });
-  persistGroupSessions(result.group_session_declarations || []);
-  persistGroupContexts(result.group_context_updates || []);
-  const removedGroupIds = listOf(result.removed_groups)
-    .map((item) => (typeof item === "string" ? item : firstText(item.group_id, item.id)))
-    .filter(Boolean);
-  removeGroupCacheEntries(removedGroupIds);
+}
+
+async function fetchGroupProtocol(state, groupId) {
+  return request(`/groups/${groupId}/protocol`, {
+    method: "GET",
+    token: state.token,
+  });
+}
+
+async function fetchGroupContext(state, groupId) {
+  return request(`/groups/${groupId}/context`, {
+    method: "GET",
+    token: state.token,
+  });
+}
+
+async function mountProtocolContexts(state, groupId, options = {}) {
+  const normalizedGroupId = firstText(groupId, state.groupId);
+  if (!normalizedGroupId) {
+    return {
+      agent_protocol: null,
+      group_protocol: null,
+      group_context: null,
+      action_type: firstText(options.actionType, "community.connect"),
+      mounted_at: null,
+    };
+  }
+  const actionType = firstText(options.actionType, "community.connect");
+  const trigger = firstText(options.trigger, null);
+  const metadata = dictOf(options.metadata);
+  const [agentProtocol, groupProtocolEnvelope, groupContext] = await Promise.all([
+    fetchAgentProtocolContext(state, normalizedGroupId, {
+      actionType,
+      trigger,
+      resourceId: options.resourceId,
+      metadata,
+    }),
+    fetchGroupProtocol(state, normalizedGroupId),
+    fetchGroupContext(state, normalizedGroupId),
+  ]);
+  const mountedAt = new Date().toISOString();
+  const groupProtocol = dictOf(groupProtocolEnvelope).protocol || groupProtocolEnvelope;
+  persistAgentProtocols([
+    {
+      group_id: normalizedGroupId,
+      agent_protocol_version: firstText(agentProtocol?.protocol_version, COMMUNITY_PROTOCOL_VERSION),
+      mounted_at: mountedAt,
+      action_type: actionType,
+      agent_protocol: agentProtocol,
+    },
+  ]);
+  persistGroupProtocols([
+    {
+      group_id: normalizedGroupId,
+      group_protocol_version: firstText(groupProtocol?.version, COMMUNITY_PROTOCOL_VERSION),
+      mounted_at: mountedAt,
+      group_protocol: groupProtocol,
+    },
+  ]);
+  persistGroupContexts([
+    {
+      group_id: normalizedGroupId,
+      group_context_version: firstText(groupContext?.group_context_version, mountedAt),
+      mounted_at: mountedAt,
+      group_context: groupContext,
+    },
+  ]);
+  return {
+    agent_protocol: agentProtocol,
+    group_protocol: groupProtocol,
+    group_context: groupContext,
+    action_type: actionType,
+    mounted_at: mountedAt,
+    trigger,
+  };
+}
+
+export async function syncCommunitySession(state, options = {}) {
+  const sessionSync = await request("/agents/me/session/sync", {
+    method: "POST",
+    token: state.token,
+    body: JSON.stringify({
+      agent_id: firstCanonicalUuid(state.agentId),
+      agent_session_id: firstCanonicalUuid(state.agentSessionId),
+      community_protocol_version: COMMUNITY_PROTOCOL_VERSION,
+      runtime_version: RUNTIME_VERSION,
+      skill_version: SKILL_VERSION,
+      onboarding_version: ONBOARDING_VERSION,
+      group_session_versions: currentVersionMap(GROUP_PROTOCOLS_PATH, "group_session_version"),
+      group_context_versions: currentVersionMap(GROUP_CONTEXTS_PATH, "group_context_version"),
+      full_sync_requested: !firstCanonicalUuid(state.agentSessionId),
+    }),
+  });
+  persistGroupProtocols(
+    listOf(sessionSync?.group_session_declarations).map((item) => ({
+      group_id: item?.group_id,
+      group_session_version: firstText(item?.group_session_version),
+      group_protocol_version: firstText(item?.group_session_version),
+      mounted_at: item?.mounted_at || new Date().toISOString(),
+      group_protocol: dictOf(item?.group_protocol),
+      group: dictOf(item?.group),
+    })),
+  );
+  persistGroupContexts(
+    listOf(sessionSync?.group_context_updates).map((item) => ({
+      group_id: item?.group_id,
+      group_context_version: firstText(item?.group_context_version),
+      mounted_at: item?.mounted_at || new Date().toISOString(),
+      group_context: dictOf(item?.group_context),
+    })),
+  );
+  removePersistedGroupArtifacts(sessionSync?.removed_groups);
+  const protocolMount = await mountProtocolContexts(state, options.groupId || state.groupId, {
+    actionType: firstText(options.actionType, "group.enter"),
+    trigger: firstText(options.trigger, "connect"),
+    resourceId: options.resourceId,
+    metadata: dictOf(options.metadata),
+  });
   const nextState = {
     ...state,
-    communityProtocolVersion: result.community_protocol_version,
-    agentSessionId: result.agent_session?.agent_session_id || state.agentSessionId || null,
-    runtimeVersion: result.agent_session?.runtime_version || RUNTIME_VERSION,
-    skillVersion: result.agent_session?.skill_version || SKILL_VERSION,
-    onboardingVersion: result.agent_session?.onboarding_version || ONBOARDING_VERSION,
-    onboardingRequired: Boolean(result.onboarding_required),
-    removedGroups: removedGroupIds,
-    lastSyncAt: result.agent_session?.last_sync_at || null,
+    communityProtocolVersion: firstText(
+      sessionSync?.community_protocol_version,
+      protocolMount.agent_protocol?.protocol_version,
+      COMMUNITY_PROTOCOL_VERSION,
+    ),
+    agentSessionId: firstCanonicalUuid(sessionSync?.agent_session?.agent_session_id, state.agentSessionId),
+    runtimeVersion: firstText(sessionSync?.agent_session?.runtime_version, state.runtimeVersion, RUNTIME_VERSION),
+    skillVersion: firstText(sessionSync?.agent_session?.skill_version, state.skillVersion, SKILL_VERSION),
+    onboardingVersion: firstText(
+      sessionSync?.agent_session?.onboarding_version,
+      state.onboardingVersion,
+      ONBOARDING_VERSION,
+    ),
+    onboardingRequired: Boolean(sessionSync?.onboarding_required),
+    lastSyncAt: firstText(sessionSync?.agent_session?.last_sync_at, protocolMount.mounted_at),
+    protocolMountedAt: protocolMount.mounted_at,
   };
   saveCommunityState(nextState);
-  return { state: nextState, sync: result, onboardingRequired: Boolean(result.onboarding_required), removedGroups: removedGroupIds };
+  return { state: nextState, protocolMount, sessionSync };
 }
 
 export async function connectToCommunity(savedState = {}) {
@@ -421,40 +659,78 @@ export async function connectToCommunity(savedState = {}) {
   installAgentProtocol();
   let state = { ...loadSavedCommunityState(), ...savedState };
   state = await ensureAgent(state);
+  saveCommunityState(state);
   state = await ensureGroup(state);
+  saveCommunityState(state);
   state = await ensureAgentWebhook(state);
-  const synced = await syncCommunitySession(state, { fullSyncRequested: !state.agentSessionId });
+  saveCommunityState(state);
+  const synced = await syncCommunitySession(state, { groupId: state.groupId, actionType: "group.enter", trigger: "connect" });
   saveCommunityState(synced.state);
   return synced.state;
+}
+
+function buildEnvelopeExtensions(sourceExtensions, metadata, envelopePayload = {}) {
+  const baseExtensions = dictOf(sourceExtensions);
+  const baseCustom = dictOf(baseExtensions.custom);
+  const custom = { ...baseCustom };
+  for (const [key, value] of Object.entries(dictOf(metadata))) {
+    if (["target_agent_id", "mentions"].includes(key)) {
+      continue;
+    }
+    custom[key] = value;
+  }
+  if (Object.keys(dictOf(envelopePayload.context_block)).length || Object.keys(dictOf(envelopePayload.status_block)).length) {
+    custom.message_envelope = {
+      context_block: dictOf(envelopePayload.context_block),
+      status_block: dictOf(envelopePayload.status_block),
+    };
+  }
+  return {
+    ...baseExtensions,
+    source: COMMUNITY_SKILL_SOURCE,
+    client_request_id: firstText(baseExtensions.client_request_id) || crypto.randomUUID(),
+    outbound_correlation_id: firstText(baseExtensions.outbound_correlation_id) || crypto.randomUUID(),
+    custom,
+  };
 }
 
 function normalizeManualPayload(payload) {
   const source = dictOf(payload);
   const content = dictOf(source.content);
-  const body = dictOf(source.body);
   const routing = dictOf(source.routing);
   const relations = dictOf(source.relations);
+  const metadata = dictOf(content.metadata);
   return {
-    group_id: source.group_id,
-    author_kind: source.author_kind,
+    group_id: firstText(source.group_id),
+    author_kind: firstText(source.author_kind, "agent"),
+    author: {
+      agent_id: firstText(dictOf(source.author).agent_id, source.agent_id) || null,
+    },
     flow_type: normalizeFlowType(source.flow_type),
     message_type: firstText(source.message_type) || "analysis",
     content: {
-      text: firstText(content.text, body.text),
+      text: firstText(content.text),
       payload: dictOf(content.payload),
-      blocks: listOf(content.blocks).length ? listOf(content.blocks) : listOf(body.blocks),
-      attachments: listOf(content.attachments).length ? listOf(content.attachments) : listOf(body.attachments),
+      blocks: listOf(content.blocks),
+      attachments: listOf(content.attachments),
+      metadata,
     },
-    status_block: dictOf(source.status_block),
-    context_block: dictOf(source.context_block),
     routing: {
-      target: dictOf(routing.target),
-      mentions: listOf(routing.mentions),
+      target: {
+        agent_id: firstText(
+          dictOf(routing.target).agent_id,
+          source.target_agent_id,
+          metadata.target_agent_id,
+        ) || null,
+      },
+      mentions: listOf(routing.mentions).length ? listOf(routing.mentions) : listOf(metadata.mentions),
     },
     relations: {
       thread_id: firstCanonicalUuid(relations.thread_id, source.thread_id, null),
       parent_message_id: firstCanonicalUuid(relations.parent_message_id, source.parent_message_id, null),
     },
+    context_block: dictOf(source.context_block),
+    status_block: dictOf(source.status_block),
     extensions: dictOf(source.extensions),
   };
 }
@@ -479,91 +755,129 @@ function inheritCanonicalRelations(requestBody, incomingMessage) {
         incoming.id,
         incomingRelations.parent_message_id,
         incoming.parent_message_id,
-        incoming.thread_id,
         null,
       ),
     },
   };
 }
 
-function buildAutoReplyText(judgment, state) {
-  const message = dictOf(judgment?.message);
-  const signals = dictOf(judgment?.signals);
-  const displayName = firstText(state?.profile?.display_name, state?.agentName, "Codex");
-  if (signals.question) {
-    return `${displayName} received your message and is processing it.`;
+export function buildCommunityMessage(state, incomingMessage, payload) {
+  const requestBody = inheritCanonicalRelations(normalizeManualPayload(payload), incomingMessage);
+  if (!requestBody.group_id) {
+    throw new Error("buildCommunityMessage requires group_id");
   }
-  const sourceText = firstText(message.text);
-  if (sourceText) {
-    return `${displayName} received your community message.`;
+  if (
+    !textOf(requestBody.content.text) &&
+    !Object.keys(dictOf(requestBody.context_block)).length &&
+    !Object.keys(dictOf(requestBody.status_block)).length
+  ) {
+    throw new Error("buildCommunityMessage requires content.text, context_block, or status_block");
   }
-  return `${displayName} received the community event.`;
-}
-
-function shouldAutoReply(judgment) {
-  const signals = dictOf(judgment?.signals);
-  const obligation = firstText(judgment?.obligation?.obligation);
-  if (signals.self_message) {
-    return false;
-  }
-  if (!signals.group_scope) {
-    return false;
-  }
-  if (obligation === "observe_only") {
-    return false;
-  }
-  return Boolean(signals.targeted || signals.mentioned || signals.question || obligation === "required");
-}
-
-function buildAutoReplyPayload(judgment, state) {
-  const message = dictOf(judgment?.message);
   return {
-    group_id: message.group_id || state.groupId || null,
-    flow_type: "run",
-    message_type: "analysis",
-    content: {
-      text: buildAutoReplyText(judgment, state),
-      payload: {},
-      blocks: [],
-      attachments: [],
+    group_id: requestBody.group_id,
+    author_kind: requestBody.author_kind,
+    author: {
+      agent_id: firstText(requestBody.author.agent_id, state?.agentId) || null,
     },
+    flow_type: requestBody.flow_type,
+    message_type: requestBody.message_type,
+    content: {
+      text: textOf(requestBody.content.text) || null,
+      payload: dictOf(requestBody.content.payload),
+      blocks: listOf(requestBody.content.blocks),
+      attachments: listOf(requestBody.content.attachments),
+    },
+    relations: {
+      thread_id: requestBody.relations.thread_id,
+      parent_message_id: requestBody.relations.parent_message_id,
+    },
+    routing: {
+      target: {
+        agent_id: firstText(requestBody.routing.target.agent_id) || null,
+      },
+      mentions: listOf(requestBody.routing.mentions),
+    },
+    extensions: buildEnvelopeExtensions(requestBody.extensions, requestBody.content.metadata, requestBody),
   };
+}
+
+export function buildDirectedCollaborationMessage(state, incomingMessage, payload = {}) {
+  return buildCommunityMessage(state, incomingMessage, {
+    ...dictOf(payload),
+    routing: {
+      ...dictOf(payload.routing),
+      target: {
+        agent_id: firstText(
+          payload.target_agent_id,
+          dictOf(dictOf(payload.routing).target).agent_id,
+          null,
+        ) || null,
+      },
+    },
+  });
 }
 
 export async function sendCommunityMessage(state, incomingMessage, payload) {
-  const requestBody = inheritCanonicalRelations(normalizeManualPayload(payload), incomingMessage);
-  if (!requestBody.group_id) {
-    throw new Error("sendCommunityMessage requires group_id");
-  }
-  if (!textOf(requestBody.content.text) && !Object.keys(requestBody.context_block).length && !Object.keys(requestBody.status_block).length) {
-    throw new Error("sendCommunityMessage requires content.text, context_block, or status_block");
-  }
-  requestBody.extensions = {
-    ...dictOf(requestBody.extensions),
-    source: COMMUNITY_SKILL_SOURCE,
-  };
-  console.log(JSON.stringify({ ok: true, outbound_structured_message: true, body: requestBody }, null, 2));
+  const body = buildCommunityMessage(state, incomingMessage, payload);
+  console.log(JSON.stringify({ ok: true, outbound_structured_message: true, body }, null, 2));
   return request("/messages", {
     method: "POST",
     token: state.token,
     headers: {
       "X-Community-Skill-Channel": COMMUNITY_SKILL_CHANNEL,
     },
-    body: JSON.stringify(requestBody),
+    body: JSON.stringify(body),
   });
+}
+
+export function handleProtocolViolation(state, payload) {
+  const record = {
+    received_at: new Date().toISOString(),
+    agent_id: firstText(state?.agentId, null) || null,
+    group_id: firstText(payload?.group_id, payload?.event?.group_id, payload?.entity?.group_id, null) || null,
+    payload: dictOf(payload),
+  };
+  return appendJsonRecord(PROTOCOL_VIOLATIONS_PATH, record, 200);
+}
+
+export function loadGroupContext(state, groupId, payload) {
+  persistGroupContexts([
+    {
+      group_id: groupId,
+      group_context_version: new Date().toISOString(),
+      group_context: dictOf(payload),
+    },
+  ]);
+  return { state, groupId };
+}
+
+export const loadChannelContext = loadGroupContext;
+
+export function loadGroupProtocol(state, groupId, payload) {
+  persistGroupProtocols([
+    {
+      group_id: groupId,
+      group_protocol_version: firstText(payload?.version, COMMUNITY_PROTOCOL_VERSION),
+      mounted_at: new Date().toISOString(),
+      group_protocol: dictOf(payload),
+    },
+  ]);
+  return { state, groupId };
 }
 
 function persistDeliverableArtifacts(event) {
   const source = dictOf(event);
   const eventEnvelope = dictOf(source.event);
   const payload = dictOf(eventEnvelope.payload);
-  const declaration = source.entity?.group_session_declaration || payload.group_session_declaration;
-  const contextUpdate = source.entity?.group_context || payload.group_context;
-  if (declaration) {
-    persistGroupSessions([declaration]);
-  }
-  if (contextUpdate) {
-    persistGroupContexts([contextUpdate]);
+  const maybeGroupContext = source.entity?.group_context || payload.group_context;
+  if (maybeGroupContext && maybeGroupContext.group_id) {
+    persistGroupContexts([
+      {
+        group_id: maybeGroupContext.group_id,
+        group_context_version: new Date().toISOString(),
+        group_context: maybeGroupContext,
+      },
+    ]);
   }
   if (source.message?.group_id && source.message?.context_block?.group_context) {
     persistGroupContexts([
@@ -576,18 +890,8 @@ function persistDeliverableArtifacts(event) {
   }
 }
 
-function runtimeContextFor(groupId) {
-  const sessions = loadJson(GROUP_SESSIONS_PATH, {}) || {};
-  const contexts = loadJson(GROUP_CONTEXTS_PATH, {}) || {};
-  return {
-    group_session: sessions[groupId] || null,
-    group_context: contexts[groupId]?.group_context || null,
-    group_context_version: contexts[groupId]?.group_context_version || null,
-  };
-}
-
 async function loadRuntimeModule() {
-  const runtimePath = fs.existsSync(WORKSPACE_RUNTIME_PATH) ? WORKSPACE_RUNTIME_PATH : BUNDLED_RUNTIME_PATH;
+  const runtimePath = fs.existsSync(INSTALLED_RUNTIME_PATH) ? INSTALLED_RUNTIME_PATH : BUNDLED_RUNTIME_PATH;
   if (!runtimeModulePromise || runtimeModuleLoadedFrom !== runtimePath) {
     runtimeModuleLoadedFrom = runtimePath;
     runtimeModulePromise = import(`${pathToFileURL(runtimePath).href}?ts=${Date.now()}`);
@@ -596,11 +900,13 @@ async function loadRuntimeModule() {
 }
 
 function isInternalNonIntake(eventType) {
-  return ["message.accepted", "message.rejected", "message.delivery_failed", "outbound.canonicalized", "sender.acknowledged"].includes(String(eventType || "").trim());
+  return ["message.accepted", "message.rejected", "message.delivery_failed", "outbound.canonicalized", "sender.acknowledged"].includes(
+    String(eventType || "").trim(),
+  );
 }
 
 export async function receiveCommunityEvent(state, event) {
-  const eventType = textOf(event?.event?.event_type || event?.event_type);
+  const eventType = firstText(event?.event?.event_type, event?.event_type);
   if (isInternalNonIntake(eventType)) {
     return {
       ignored: true,
@@ -608,24 +914,37 @@ export async function receiveCommunityEvent(state, event) {
       event_type: eventType,
     };
   }
+
   persistDeliverableArtifacts(event);
   const runtimeModule = await loadRuntimeModule();
   const groupId = firstText(event?.group_id, event?.event?.group_id, event?.message?.group_id, event?.entity?.message?.group_id);
-  const judgment = await runtimeModule.handleRuntimeEvent({}, state, event, runtimeContextFor(groupId));
-  let outbound = null;
-  if (shouldAutoReply(judgment)) {
-    const result = await sendCommunityMessage(state, judgment.message, buildAutoReplyPayload(judgment, state));
-    outbound = {
-      sent: true,
-      message_id: result?.id || null,
-      group_id: result?.group_id || null,
-    };
-  }
+  const protocolMount = await mountProtocolContexts(state, groupId, {
+    actionType: resolveProtocolActionType(event),
+    trigger: eventType || "event",
+    resourceId: firstCanonicalUuid(event?.entity?.message?.id, event?.message?.id, null),
+    metadata: {
+      event_type: eventType || null,
+    },
+  });
+  const judgment = await runtimeModule.handleRuntimeEvent(
+    {
+      handleProtocolViolation,
+      loadGroupContext,
+      loadGroupProtocol,
+    },
+    state,
+    event,
+    {
+      ...runtimeContextFor(groupId),
+      protocol_mount: protocolMount,
+    },
+  );
   return {
     handled: true,
     hot_path_role: "judgment_only",
     judgment,
-    outbound,
+    protocol_mount: protocolMount,
+    outbound: null,
   };
 }
 
@@ -646,24 +965,44 @@ function verifySignature(secret, rawBody, signature) {
   }
 }
 
+function cleanupStaleSocket(socketPath) {
+  const normalizedPath = textOf(socketPath);
+  if (!normalizedPath || normalizedPath.startsWith("\\\\")) {
+    return normalizedPath;
+  }
+  ensureDir(normalizedPath);
+  if (!fs.existsSync(normalizedPath)) {
+    return normalizedPath;
+  }
+  try {
+    fs.rmSync(normalizedPath, { force: true });
+  } catch (error) {
+    throw new Error(`failed to remove stale socket at ${normalizedPath}: ${error.message}`);
+  }
+  return normalizedPath;
+}
+
 async function handleManualSend(state, payload) {
   return sendCommunityMessage(state, null, payload);
 }
 
 export async function startCommunityIntegration() {
-  const state = await connectToCommunity(loadSavedCommunityState());
+  let state = await connectToCommunity(loadSavedCommunityState());
   const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && req.url === "/healthz") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        ok: true,
-        agentId: state.agentId || null,
-        agentName: state.agentName || AGENT_NAME,
-        groupId: state.groupId || null,
-        communityProtocolVersion: state.communityProtocolVersion || COMMUNITY_PROTOCOL_VERSION,
-        runtimeRole: "judgment_only",
-        skillRole: "onboarding_sync_transport",
-      }));
+      res.end(
+        JSON.stringify({
+          ok: true,
+          agentId: state.agentId || null,
+          agentName: state.agentName || AGENT_NAME,
+          groupId: state.groupId || null,
+          communityProtocolVersion: state.communityProtocolVersion || COMMUNITY_PROTOCOL_VERSION,
+          runtimeRole: "judgment_only",
+          skillRole: "onboarding_protocol_mount_transport",
+          stateHome: STATE_HOME,
+        }),
+      );
       return;
     }
 
@@ -672,6 +1011,7 @@ export async function startCommunityIntegration() {
       req.on("data", (chunk) => chunks.push(chunk));
       req.on("end", async () => {
         try {
+          state = { ...state, ...loadSavedCommunityState() };
           const payload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
           const result = await handleManualSend(state, payload);
           res.writeHead(202, { "Content-Type": "application/json" });
@@ -694,6 +1034,7 @@ export async function startCommunityIntegration() {
     req.on("data", (chunk) => chunks.push(chunk));
     req.on("end", async () => {
       try {
+        state = { ...state, ...loadSavedCommunityState() };
         const rawBody = Buffer.concat(chunks);
         const signature = req.headers["x-community-webhook-signature"];
         if (typeof signature !== "string" || !verifySignature(state.webhookSecret, rawBody, signature)) {
@@ -719,38 +1060,45 @@ export async function startCommunityIntegration() {
       throw new Error("COMMUNITY_AGENT_SOCKET_PATH is required when COMMUNITY_TRANSPORT=unix_socket");
     }
     server.listen(socketPath, () => {
-      console.log(JSON.stringify({
-        ok: true,
-        listening: true,
-        transportMode: TRANSPORT_MODE,
-        socketPath,
-        webhookPath: WEBHOOK_PATH,
-        sendPath: SEND_PATH,
-        runtimeRole: "judgment_only",
-        skillRole: "onboarding_sync_transport",
-      }, null, 2));
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            listening: true,
+            transportMode: TRANSPORT_MODE,
+            socketPath,
+            webhookPath: WEBHOOK_PATH,
+            sendPath: SEND_PATH,
+            runtimeRole: "judgment_only",
+            skillRole: "onboarding_protocol_mount_transport",
+            stateHome: STATE_HOME,
+          },
+          null,
+          2,
+        ),
+      );
     });
     return;
   }
 
   server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-    console.log(JSON.stringify({
-      ok: true,
-      listening: true,
-      transportMode: TRANSPORT_MODE,
-      listenHost: LISTEN_HOST,
-      listenPort: LISTEN_PORT,
-      webhookPath: WEBHOOK_PATH,
-      sendPath: SEND_PATH,
-      runtimeRole: "judgment_only",
-      skillRole: "onboarding_sync_transport",
-    }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          ok: true,
+          listening: true,
+          transportMode: TRANSPORT_MODE,
+          listenHost: LISTEN_HOST,
+          listenPort: LISTEN_PORT,
+          webhookPath: WEBHOOK_PATH,
+          sendPath: SEND_PATH,
+          runtimeRole: "judgment_only",
+          skillRole: "onboarding_protocol_mount_transport",
+          stateHome: STATE_HOME,
+        },
+        null,
+        2,
+      ),
+    );
   });
 }
-
-export const loadGroupContext = (state, groupId, payload) => {
-  persistGroupContexts([{ group_id: groupId, group_context_version: new Date().toISOString(), group_context: dictOf(payload) }]);
-  return { state, groupId };
-};
-
-export const loadChannelContext = loadGroupContext;

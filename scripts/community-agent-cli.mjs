@@ -53,6 +53,22 @@ function resolveWorkspaceRoot() {
   return path.resolve(SKILL_ROOT);
 }
 
+function resolveSkillStateHome(workspaceRoot) {
+  const explicit = firstNonEmpty(process.env.COMMUNITY_STATE_HOME, process.env.COMMUNITY_TEMPLATE_HOME);
+  if (explicit) {
+    return path.resolve(explicit);
+  }
+  const preferred = path.join(workspaceRoot, STATE_DIRNAME, 'community-skill');
+  const legacy = path.join(workspaceRoot, STATE_DIRNAME, 'community-agent-template');
+  if (fs.existsSync(preferred)) {
+    return preferred;
+  }
+  if (fs.existsSync(legacy)) {
+    return legacy;
+  }
+  return preferred;
+}
+
 function parseEnvValue(raw) {
   const value = String(raw || "").trim();
   if (!value) {
@@ -95,7 +111,7 @@ let currentPhase = 'startup';
 
 const VERSION_PATH = path.join(SKILL_ROOT, 'VERSION.json');
 const RELEASES_PATH = path.join(SKILL_ROOT, 'RELEASES.json');
-const GIT_BIN = process.env.COMMUNITY_GIT_BIN || (process.platform === 'win32' ? 'D:/Program Files/Git/cmd/git.exe' : 'git');
+const GIT_BIN = process.env.COMMUNITY_GIT_BIN || 'git';
 const STATE_DIRNAME = '.openclaw';
 const ONBOARDING_INIT_STATE = 'community-onboarding-init.json';
 
@@ -296,7 +312,7 @@ function fallbackReleaseRef(version) {
   if (!normalized) {
     return null;
   }
-  return normalized.startswith('v') ? normalized : `v${normalized}`;
+  return normalized.startsWith('v') ? normalized : `v${normalized}`;
 }
 
 function latestPublishedRelease() {
@@ -435,8 +451,9 @@ function saveOnboardingInitState(patch = {}) {
 function onboardingStateSummary() {
   const state = loadOnboardingInitState();
   const envValues = parseJsonEnvFile(path.join(resolveWorkspaceRoot(), STATE_DIRNAME, 'community-agent.env'));
+  const stateHome = resolveSkillStateHome(resolveWorkspaceRoot());
   const runtimeState = loadJsonFile(
-    path.join(resolveWorkspaceRoot(), STATE_DIRNAME, 'community-agent-template', 'state', 'community-webhook-state.json'),
+    path.join(stateHome, 'state', 'community-webhook-state.json'),
     {},
   ) || {};
   const initialized = Boolean(
@@ -554,14 +571,7 @@ function recentSendCacheEntry(idempotencyKey) {
   return entry;
 }
 
-function buildSyntheticSuccessResponse(status, data) {
-  return new Response(JSON.stringify({ success: true, data }), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-async function withSendRequestSuccessHandling(idempotencyKey, callback) {
+async function withSendRequestIdempotency(idempotencyKey, callback) {
   const originalFetch = globalThis.fetch.bind(globalThis);
   globalThis.fetch = async (input, init = {}) => {
     const url = typeof input === "string" ? input : input?.url || "";
@@ -575,17 +585,6 @@ async function withSendRequestSuccessHandling(idempotencyKey, callback) {
         signal: AbortSignal.timeout(COMMAND_REQUEST_TIMEOUT_MS),
       });
       trace("send.api_response_headers", { status: response.status, ok: response.ok, idempotencyKey });
-      if (response.ok) {
-        upsertSendCacheEntry(idempotencyKey, {
-          state: "sent",
-          status: response.status,
-        });
-        return buildSyntheticSuccessResponse(response.status, {
-          accepted: true,
-          status: response.status,
-          idempotency_key: idempotencyKey,
-        });
-      }
       return response;
     }
     return originalFetch(input, init);
@@ -636,10 +635,12 @@ async function getRuntime() {
   loadEnvFile(workspaceBootstrap);
   loadEnvFile(workspaceEnv);
   process.env.WORKSPACE_ROOT = process.env.WORKSPACE_ROOT || workspaceRoot;
+  process.env.COMMUNITY_STATE_HOME = process.env.COMMUNITY_STATE_HOME || resolveSkillStateHome(workspaceRoot);
 
   loadedContext = {
     workspaceRoot,
     stateDir,
+    stateHome: process.env.COMMUNITY_STATE_HOME,
     bundledBootstrap,
     workspaceBootstrap,
     workspaceEnv,
@@ -672,20 +673,36 @@ async function requireSavedState(requirements = {}) {
 function localStateCleanupPaths() {
   const workspaceRoot = loadedContext?.workspaceRoot || resolveWorkspaceRoot();
   const stateRoot = path.join(workspaceRoot, STATE_DIRNAME);
-  return [
+  const preferredStateHome = path.join(stateRoot, 'community-skill');
+  const legacyStateHome = path.join(stateRoot, 'community-agent-template');
+  const configuredStateHome = loadedContext?.stateHome || resolveSkillStateHome(workspaceRoot);
+  const paths = [
     path.join(stateRoot, 'community-agent.env'),
     path.join(stateRoot, 'community-bootstrap.env'),
     path.join(stateRoot, 'community-agent.bootstrap.json'),
     path.join(stateRoot, 'community-skill-version.json'),
     path.join(stateRoot, 'community-send-idempotency.json'),
-    path.join(stateRoot, 'community-agent-template', 'state', 'community-webhook-state.json'),
-    path.join(stateRoot, 'community-agent-template', 'state', 'community-channel-contexts.json'),
-    path.join(stateRoot, 'community-agent-template', 'state', 'community-workflow-contracts.json'),
-    path.join(stateRoot, 'community-agent-template', 'state', 'community-protocol-violations.json'),
-    path.join(stateRoot, 'community-agent-template', 'state', 'community-outbound-receipts.json'),
-    path.join(stateRoot, 'community-agent-template', 'state', 'community-outbound-debug.json'),
-    path.join(stateRoot, 'community-agent-template', 'state', 'community-outbound-guard.json'),
+    path.join(configuredStateHome, 'state', 'community-webhook-state.json'),
+    path.join(configuredStateHome, 'state', 'community-group-contexts.json'),
+    path.join(configuredStateHome, 'state', 'community-group-protocols.json'),
+    path.join(configuredStateHome, 'state', 'community-agent-protocols.json'),
+    path.join(configuredStateHome, 'state', 'community-protocol-violations.json'),
+    path.join(configuredStateHome, 'assets', 'AGENT_PROTOCOL.md'),
+    path.join(configuredStateHome, 'assets', 'community-runtime-v0.mjs'),
+    path.join(preferredStateHome, 'state', 'community-webhook-state.json'),
+    path.join(preferredStateHome, 'state', 'community-group-contexts.json'),
+    path.join(preferredStateHome, 'state', 'community-group-protocols.json'),
+    path.join(preferredStateHome, 'state', 'community-agent-protocols.json'),
+    path.join(preferredStateHome, 'state', 'community-protocol-violations.json'),
+    path.join(legacyStateHome, 'state', 'community-webhook-state.json'),
+    path.join(legacyStateHome, 'state', 'community-channel-contexts.json'),
+    path.join(legacyStateHome, 'state', 'community-workflow-contracts.json'),
+    path.join(legacyStateHome, 'state', 'community-protocol-violations.json'),
+    path.join(legacyStateHome, 'state', 'community-outbound-receipts.json'),
+    path.join(legacyStateHome, 'state', 'community-outbound-debug.json'),
+    path.join(legacyStateHome, 'state', 'community-outbound-guard.json'),
   ];
+  return [...new Set(paths)];
 }
 
 async function cmdCleanupLocalState(options) {
@@ -857,6 +874,7 @@ async function cmdStatus() {
         skillVersion: (loadVersionManifest().version || null),
         skillReleaseRef: (loadVersionManifest().release_ref || null),
         workspaceRoot: loadedContext?.workspaceRoot || null,
+        stateHome: loadedContext?.stateHome || null,
         envFile: loadedContext?.workspaceEnv || null,
       },
       null,
@@ -918,10 +936,22 @@ async function cmdSend(options) {
 
   trace("send.request_start", { groupId: payload.group_id, messageType: payload.message_type, idempotencyKey });
   try {
-    const result = await withSendRequestSuccessHandling(idempotencyKey, () => runtime.sendCommunityMessage(state, null, payload));
+    const result = await withSendRequestIdempotency(idempotencyKey, () => runtime.sendCommunityMessage(state, null, payload));
     trace("send.request_response_received", { idempotencyKey });
+    const canonicalEffect = await runtime.verifyCanonicalMessageVisible(state, {
+      groupId: payload.group_id,
+      messageId: result?.id || null,
+      idempotencyKey,
+      text,
+    });
+    upsertSendCacheEntry(idempotencyKey, {
+      state: "sent",
+      groupId: payload.group_id,
+      messageType: payload.message_type,
+      communityMessageId: canonicalEffect?.message?.id || result?.id || null,
+    });
     trace("send.success_condition_satisfied", { idempotencyKey });
-    console.log(JSON.stringify({ ok: true, command: "send", result, idempotencyKey }, null, 2));
+    console.log(JSON.stringify({ ok: true, command: "send", result, idempotencyKey, canonicalEffect }, null, 2));
     trace("send.command_exit");
   } catch (error) {
     upsertSendCacheEntry(idempotencyKey, {

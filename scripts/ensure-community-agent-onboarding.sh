@@ -13,7 +13,19 @@ fi
 
 WORKSPACE_ROOT="${RESOLVED_WORKSPACE_ROOT}"
 STATE_DIR="${WORKSPACE_ROOT}/.openclaw"
-TEMPLATE_HOME="${STATE_DIR}/community-agent-template"
+DEFAULT_STATE_HOME="${STATE_DIR}/community-skill"
+LEGACY_STATE_HOME="${STATE_DIR}/community-agent-template"
+if [[ -n "${COMMUNITY_STATE_HOME:-}" ]]; then
+  TEMPLATE_HOME="${COMMUNITY_STATE_HOME}"
+elif [[ -n "${COMMUNITY_TEMPLATE_HOME:-}" ]]; then
+  TEMPLATE_HOME="${COMMUNITY_TEMPLATE_HOME}"
+elif [[ -d "${DEFAULT_STATE_HOME}" ]]; then
+  TEMPLATE_HOME="${DEFAULT_STATE_HOME}"
+elif [[ -d "${LEGACY_STATE_HOME}" ]]; then
+  TEMPLATE_HOME="${LEGACY_STATE_HOME}"
+else
+  TEMPLATE_HOME="${DEFAULT_STATE_HOME}"
+fi
 ASSETS_DIR="${TEMPLATE_HOME}/assets"
 STATE_PATH="${TEMPLATE_HOME}/state/community-webhook-state.json"
 ENV_FILE="${STATE_DIR}/community-agent.env"
@@ -256,6 +268,59 @@ PY
   return 1
 }
 
+wait_for_agent_webhook() {
+  local base_url="${1}"
+  local state_path="${2}"
+  local attempts="${3:-120}"
+  local delay="${4:-0.5}"
+  local i token output_path
+  output_path="$(mktemp)"
+  trap 'rm -f "${output_path}"' RETURN
+
+  for ((i=1; i<=attempts; i+=1)); do
+    token="$(python3 - "${state_path}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except (FileNotFoundError, json.JSONDecodeError):
+    print("")
+    raise SystemExit(0)
+
+print(data.get("token", "") or "")
+PY
+)"
+    if [[ -n "${token}" ]] && curl -fsS -H "X-Agent-Token: ${token}" "${base_url}/agents/me/webhook" >"${output_path}" 2>/dev/null; then
+      if python3 - "${output_path}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as fh:
+    payload = json.load(fh)
+data = payload.get("data")
+if not isinstance(data, dict):
+    raise SystemExit(1)
+if not data.get("target_url"):
+    raise SystemExit(1)
+PY
+      then
+        WEBHOOK_READY_POLLS="${i}"
+        WEBHOOK_READY_SECONDS="$(awk "BEGIN { printf \"%.1f\", ${i} * ${delay} }")"
+        return 0
+      fi
+    fi
+    sleep "${delay}"
+  done
+
+  WEBHOOK_READY_POLLS="${attempts}"
+  WEBHOOK_READY_SECONDS="$(awk "BEGIN { printf \"%.1f\", ${attempts} * ${delay} }")"
+  return 1
+}
+
 validate_base_url() {
   local base_url="${1}"
   if [[ -z "${base_url}" ]]; then
@@ -429,6 +494,7 @@ COMMUNITY_GROUP_SLUG=$(quote_env_value "${GROUP_SLUG}")
 COMMUNITY_SERVICE_NAME=$(quote_env_value "${SERVICE_NAME}")
 COMMUNITY_AGENT_NAME=$(quote_env_value "${AGENT_NAME}")
 COMMUNITY_AGENT_DESCRIPTION=$(quote_env_value "${AGENT_DESCRIPTION}")
+COMMUNITY_STATE_HOME=$(quote_env_value "${TEMPLATE_HOME}")
 COMMUNITY_TEMPLATE_HOME=$(quote_env_value "${TEMPLATE_HOME}")
 COMMUNITY_INGRESS_HOME=$(quote_env_value "${INGRESS_HOME}")
 COMMUNITY_TRANSPORT=$(quote_env_value "unix_socket")
@@ -624,6 +690,13 @@ if wait_for_saved_state "${STATE_PATH}" "${COMMUNITY_STATE_WAIT_ATTEMPTS:-240}" 
 else
   echo "agent community state did not become ready during onboarding window after ${STATE_READY_SECONDS}s (${STATE_READY_POLLS} polls): ${STATE_PATH}" >&2
   echo "expected saved state with token, groupId, and agentId" >&2
+  exit 1
+fi
+
+if wait_for_agent_webhook "${BASE_URL}" "${STATE_PATH}" "${COMMUNITY_WEBHOOK_WAIT_ATTEMPTS:-120}" "${COMMUNITY_WEBHOOK_WAIT_DELAY:-0.5}"; then
+  echo "PASS agent webhook registered after ${WEBHOOK_READY_SECONDS}s (${WEBHOOK_READY_POLLS} polls)"
+else
+  echo "agent webhook subscription did not become active after ${WEBHOOK_READY_SECONDS}s (${WEBHOOK_READY_POLLS} polls)" >&2
   exit 1
 fi
 

@@ -20,7 +20,7 @@
 ## 当前发布版本
 
 当前正式发布基线为：
-- `v1.0.0`
+- `v1.2.0`
 
 版本元数据位于：
 - `VERSION.json`
@@ -65,8 +65,8 @@ CLI 会复用本地保存的 community state：
 ```bash
 node scripts/community-agent-cli.mjs version
 node scripts/community-agent-cli.mjs release-list
-node scripts/community-agent-cli.mjs self-update --version 1.0.0
-node scripts/community-agent-cli.mjs rollback --version 1.0.0
+node scripts/community-agent-cli.mjs self-update --version 1.2.0
+node scripts/community-agent-cli.mjs rollback --version 1.2.0
 ```
 
 当前策略是：

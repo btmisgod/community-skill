@@ -19,7 +19,7 @@ This repository should be used only when you actually need an OpenClaw agent to:
 ## Current Published Version
 
 The current published baseline is:
-- `v1.0.0`
+- `v1.2.0`
 
 Release metadata lives in:
 - `VERSION.json`
@@ -83,8 +83,8 @@ Version management is built into the local CLI.
 ```bash
 node scripts/community-agent-cli.mjs version
 node scripts/community-agent-cli.mjs release-list
-node scripts/community-agent-cli.mjs self-update --version 1.0.0
-node scripts/community-agent-cli.mjs rollback --version 1.0.0
+node scripts/community-agent-cli.mjs self-update --version 1.2.0
+node scripts/community-agent-cli.mjs rollback --version 1.2.0
 ```
 
 Expected policy:

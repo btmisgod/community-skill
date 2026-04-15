@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -114,6 +115,7 @@ const COMMUNITY_SKILL_CHANNEL = "community-skill-v1";
 const COMMUNITY_SKILL_SOURCE = "CommunityIntegrationSkill";
 
 const STATE_PATH = path.join(STATE_ROOT, "community-webhook-state.json");
+const MODEL_RUNTIME_STATE_PATH = path.join(STATE_ROOT, "community-model-runtime.json");
 const GROUP_CONTEXTS_PATH = path.join(STATE_ROOT, "community-group-contexts.json");
 const GROUP_PROTOCOLS_PATH = path.join(STATE_ROOT, "community-group-protocols.json");
 const AGENT_PROTOCOLS_PATH = path.join(STATE_ROOT, "community-agent-protocols.json");
@@ -122,11 +124,35 @@ const BUNDLED_RUNTIME_PATH = path.join(SKILL_HOME, "assets", "community-runtime-
 const INSTALLED_RUNTIME_PATH = path.join(STATE_HOME, "assets", "community-runtime-v0.mjs");
 const BUNDLED_AGENT_PROTOCOL_PATH = path.join(SKILL_HOME, "assets", "AGENT_PROTOCOL.md");
 const INSTALLED_AGENT_PROTOCOL_PATH = path.join(STATE_HOME, "assets", "AGENT_PROTOCOL.md");
+const DEFAULT_OPENCLAW_STATE_DIR = path.join(WORKSPACE, ".openclaw", "community-openclaw");
+const OPENCLAW_STATE_DIR = path.resolve(
+  firstText(process.env.COMMUNITY_OPENCLAW_STATE_DIR, DEFAULT_OPENCLAW_STATE_DIR),
+);
+const OPENCLAW_CONFIG_PATH = path.resolve(
+  firstText(process.env.COMMUNITY_OPENCLAW_CONFIG_PATH, path.join(OPENCLAW_STATE_DIR, "openclaw.json")),
+);
+const OPENCLAW_BIN = textOf(process.env.COMMUNITY_OPENCLAW_BIN) || "openclaw";
+const OPENCLAW_PROVIDER_ID = slugifyHandle(
+  firstText(process.env.COMMUNITY_OPENCLAW_PROVIDER, "community-runtime"),
+);
+const OPENCLAW_TIMEOUT_SECONDS = (() => {
+  const parsed = Number(process.env.COMMUNITY_OPENCLAW_TIMEOUT_SECONDS || "120");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 120;
+})();
+const CANONICAL_EFFECT_ATTEMPTS = (() => {
+  const parsed = Number(process.env.COMMUNITY_CANONICAL_EFFECT_ATTEMPTS || "20");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 20;
+})();
+const CANONICAL_EFFECT_DELAY_MS = (() => {
+  const parsed = Number(process.env.COMMUNITY_CANONICAL_EFFECT_DELAY_MS || "500");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 500;
+})();
 
 const CANONICAL_UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/;
 
 let runtimeModulePromise = null;
 let runtimeModuleLoadedFrom = null;
+let agentExecutionBridgeRunner = defaultAgentExecutionBridgeRunner;
 
 function parseCanonicalUuid(value) {
   const text = firstText(value);
@@ -192,6 +218,189 @@ function buildWebhookUrl() {
     return "";
   }
   return `http://${LISTEN_HOST}:${LISTEN_PORT}${WEBHOOK_PATH}`;
+}
+
+function hashText(value) {
+  return crypto.createHash("sha256").update(String(value || "")).digest("hex").slice(0, 16);
+}
+
+function apiKeySuffix(value, chars = 4) {
+  const text = textOf(value);
+  if (!text) {
+    return "";
+  }
+  return text.slice(-Math.min(chars, text.length));
+}
+
+function formalOpenClawConfigFiles(openclawHome) {
+  const normalizedHome = textOf(openclawHome);
+  if (!normalizedHome) {
+    return [];
+  }
+  return [
+    path.join(normalizedHome, "openclaw.json"),
+    path.join(normalizedHome, "agents", "main", "agent", "models.json"),
+  ];
+}
+
+function resolveFormalOpenClawHome(workspaceRoot = WORKSPACE) {
+  const candidates = [
+    process.env.OPENCLAW_HOME,
+    path.basename(workspaceRoot) === "workspace" ? path.resolve(workspaceRoot, "..") : "",
+    "/root/.openclaw",
+  ];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const normalized = textOf(candidate);
+    if (!normalized) {
+      continue;
+    }
+    const resolved = path.resolve(normalized);
+    if (seen.has(resolved)) {
+      continue;
+    }
+    seen.add(resolved);
+    const configPath = path.join(resolved, "openclaw.json");
+    if (fs.existsSync(configPath)) {
+      return resolved;
+    }
+  }
+  return null;
+}
+
+export function resolveFormalOpenClawModelConfig(workspaceRoot = WORKSPACE) {
+  const openclawHome = resolveFormalOpenClawHome(workspaceRoot);
+  if (!openclawHome) {
+    return null;
+  }
+
+  const [openclawPath, modelsPath] = formalOpenClawConfigFiles(openclawHome);
+  const openclawConfig = loadJson(openclawPath, {}) || {};
+  const modelsConfig = loadJson(modelsPath, {}) || {};
+  const primary = textOf(openclawConfig?.agents?.defaults?.model?.primary);
+  let providerName = "";
+  let modelId = "";
+  if (primary.includes("/")) {
+    [providerName, modelId] = primary.split("/", 2);
+  }
+
+  const providers =
+    Object.keys(dictOf(modelsConfig?.providers)).length > 0
+      ? dictOf(modelsConfig?.providers)
+      : dictOf(openclawConfig?.models?.providers);
+  let providerConfig = providerName ? dictOf(providers[providerName]) : {};
+  if (!Object.keys(providerConfig).length && Object.keys(providers).length === 1) {
+    const [singleProviderName, singleProviderConfig] = Object.entries(providers)[0];
+    providerName = singleProviderName;
+    providerConfig = dictOf(singleProviderConfig);
+  }
+
+  const baseUrl = textOf(providerConfig?.baseUrl);
+  const apiKey = textOf(providerConfig?.apiKey);
+  const resolvedModelId = textOf(
+    modelId ||
+      providerConfig?.model ||
+      providerConfig?.defaultModel ||
+      openclawConfig?.agents?.defaults?.model?.default,
+  );
+  if (!baseUrl || !apiKey || !resolvedModelId) {
+    return null;
+  }
+
+  return {
+    framework: "openclaw",
+    provider: providerName || null,
+    baseUrl,
+    apiKey,
+    modelId: resolvedModelId,
+    sourceType: "formal_openclaw_config",
+    source: fs.existsSync(modelsPath) ? `${modelsPath} + ${openclawPath}` : openclawPath,
+    formalHome: openclawHome,
+    configFiles: formalOpenClawConfigFiles(openclawHome).filter((filePath) => fs.existsSync(filePath)),
+  };
+}
+
+function buildRuntimeModelState(modelConfig, extra = {}) {
+  const config = modelConfig && typeof modelConfig === "object" ? modelConfig : null;
+  return {
+    framework: "openclaw",
+    ready: Boolean(config?.baseUrl && config?.apiKey && config?.modelId),
+    inheritance_valid: Boolean(
+      config?.baseUrl && config?.apiKey && config?.modelId && textOf(config?.sourceType) === "formal_openclaw_config",
+    ),
+    source_type: config?.sourceType || null,
+    source: config?.source || null,
+    source_files: Array.isArray(config?.configFiles) ? config.configFiles : [],
+    formal_home: config?.formalHome || null,
+    provider: config?.provider || null,
+    base_url: config?.baseUrl || null,
+    model_id: config?.modelId || null,
+    api_key_present: Boolean(config?.apiKey),
+    api_key_fingerprint: config?.apiKey ? hashText(config.apiKey) : null,
+    api_key_suffix: config?.apiKey ? apiKeySuffix(config.apiKey) : null,
+    process_pid: process.pid,
+    verified_at: new Date().toISOString(),
+    state_home: STATE_HOME,
+    ...extra,
+  };
+}
+
+export function loadRuntimeModelState() {
+  return loadJson(MODEL_RUNTIME_STATE_PATH, {}) || {};
+}
+
+function saveRuntimeModelState(state) {
+  saveJson(MODEL_RUNTIME_STATE_PATH, state || {});
+  return state || {};
+}
+
+function markRuntimeModelStateUnavailable(reason, detail = "") {
+  return saveRuntimeModelState(
+    buildRuntimeModelState(null, {
+      ready: false,
+      inheritance_valid: false,
+      reason: textOf(reason) || "formal_model_config_missing",
+      detail: textOf(detail) || null,
+    }),
+  );
+}
+
+export function ensureRuntimeModelInheritance() {
+  const modelConfig = resolveFormalOpenClawModelConfig(WORKSPACE);
+  if (!modelConfig) {
+    const failure = markRuntimeModelStateUnavailable(
+      "formal_model_config_missing",
+      "Community skill could not inherit a runnable OpenClaw model config from the local formal truth source.",
+    );
+    const detail = firstText(failure.detail, failure.reason);
+    throw new Error(detail || "formal OpenClaw model config inheritance failed");
+  }
+
+  const runtimeConfig = ensureLocalOpenClawRuntimeConfig(modelConfig);
+  return saveRuntimeModelState(
+    buildRuntimeModelState(modelConfig, {
+      ready: true,
+      inheritance_valid: true,
+      bridge_provider_id: runtimeConfig.providerId,
+      bridge_primary_model: runtimeConfig.primaryModel,
+      bridge_state_dir: runtimeConfig.stateDir,
+      bridge_config_path: runtimeConfig.configPath,
+      bridge_config_written: true,
+    }),
+  );
+}
+
+function truncateText(value, maxChars = 6000) {
+  const text = String(value || "");
+  if (text.length <= maxChars) {
+    return text;
+  }
+  return `${text.slice(0, maxChars)}\n...[truncated]`;
+}
+
+function renderJsonBlock(label, value, maxChars = 6000) {
+  const serialized = JSON.stringify(value ?? {}, null, 2);
+  return `${label}:\n${truncateText(serialized, maxChars)}`;
 }
 
 function persistByGroup(filePath, key, valueKey, records) {
@@ -357,6 +566,208 @@ export async function verifyCanonicalMessageVisible(state, options = {}) {
   throw new Error(`canonical effect not observed for group ${groupId}`);
 }
 
+export function ensureLocalOpenClawRuntimeConfig(modelConfig = null) {
+  const resolvedModelConfig = modelConfig || resolveFormalOpenClawModelConfig(WORKSPACE);
+  const modelId = textOf(resolvedModelConfig?.modelId);
+  const baseUrl = textOf(resolvedModelConfig?.baseUrl);
+  const apiKey = textOf(resolvedModelConfig?.apiKey);
+
+  if (!modelId || !baseUrl || !apiKey) {
+    markRuntimeModelStateUnavailable(
+      "formal_model_config_missing",
+      "local openclaw execution bridge requires inheritable formal OpenClaw model config",
+    );
+    throw new Error(
+      "local openclaw execution bridge requires inheritable formal OpenClaw model config",
+    );
+  }
+
+  const providerId = OPENCLAW_PROVIDER_ID;
+  const config = {
+    agents: {
+      defaults: {
+        workspace: WORKSPACE,
+        model: {
+          primary: `${providerId}/${modelId}`,
+        },
+        compaction: {
+          mode: "safeguard",
+        },
+      },
+    },
+    models: {
+      providers: {
+        [providerId]: {
+          baseUrl,
+          apiKey,
+          api: "openai-completions",
+          models: [{ id: modelId, name: modelId }],
+        },
+      },
+    },
+  };
+
+  saveJson(OPENCLAW_CONFIG_PATH, config);
+  return {
+    stateDir: OPENCLAW_STATE_DIR,
+    configPath: OPENCLAW_CONFIG_PATH,
+    providerId,
+    primaryModel: `${providerId}/${modelId}`,
+  };
+}
+
+function buildAgentExecutionSessionId(message) {
+  const source = dictOf(message);
+  const scope = firstText(source.group_id, "community");
+  const thread = firstText(source.thread_id, source.id, crypto.randomUUID());
+  return `community-${slugifyHandle(AGENT_HANDLE)}-${hashText(`${scope}:${thread}`)}`;
+}
+
+export function buildAgentExecutionPrompt(params = {}) {
+  const judgment = dictOf(params.judgment);
+  const message = dictOf(judgment.message);
+  const protocolMount = dictOf(params.protocolMount);
+  const state = dictOf(params.state);
+
+  return [
+    "Community bridge task.",
+    "Produce the exact reply text that should be posted back into Agent Community for the inbound message below.",
+    "Return only the reply text. Do not add quotes, markdown fences, explanations, or extra commentary.",
+    "If the inbound message asks for an exact literal string, output that exact string only.",
+    "",
+    `Agent: ${firstText(state.agentName, AGENT_NAME)} (${firstText(state.agentId, "unknown")})`,
+    `Group slug: ${firstText(state.groupSlug, GROUP_SLUG)}`,
+    `Obligation: ${firstText(dictOf(judgment.obligation).obligation, "unknown")}`,
+    `Recommendation: ${firstText(dictOf(judgment.recommendation).mode, "unknown")}`,
+    renderJsonBlock(
+      "Inbound message",
+      {
+        id: firstText(message.id) || null,
+        group_id: firstText(message.group_id) || null,
+        author_agent_id: firstText(message.author_agent_id) || null,
+        flow_type: firstText(message.flow_type) || null,
+        message_type: firstText(message.message_type) || null,
+        thread_id: firstText(message.thread_id) || null,
+        parent_message_id: firstText(message.parent_message_id) || null,
+        target_agent_id: firstText(message.target_agent_id) || null,
+        text: firstText(message.text),
+      },
+      6000,
+    ),
+    renderJsonBlock("Mounted agent protocol", dictOf(protocolMount.agent_protocol), 4000),
+    renderJsonBlock("Mounted group protocol", dictOf(protocolMount.group_protocol), 6000),
+    renderJsonBlock("Mounted group context", dictOf(protocolMount.group_context), 4000),
+  ].join("\n\n");
+}
+
+function parseAgentCommandOutput(stdout) {
+  const raw = String(stdout || "").trim();
+  const jsonStart = raw.indexOf("{");
+  if (jsonStart < 0) {
+    throw new Error("openclaw agent produced no JSON payload");
+  }
+  return JSON.parse(raw.slice(jsonStart));
+}
+
+function extractAgentReplyText(parsed) {
+  return listOf(parsed?.payloads)
+    .map((item) => textOf(item?.text))
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+}
+
+function runCommand(bin, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, args, {
+      cwd: options.cwd || WORKSPACE,
+      env: options.env || process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      resolve({
+        code: Number(code ?? 1),
+        stdout,
+        stderr,
+      });
+    });
+  });
+}
+
+function formatCommandError(result) {
+  const stderr = String(result?.stderr || "").trim();
+  if (stderr) {
+    return truncateText(stderr, 2000);
+  }
+  const stdout = String(result?.stdout || "").trim();
+  if (stdout) {
+    return truncateText(stdout, 2000);
+  }
+  return "unknown openclaw agent failure";
+}
+
+export async function defaultAgentExecutionBridgeRunner(params = {}) {
+  const runtimeConfig = ensureLocalOpenClawRuntimeConfig();
+  const sessionId = buildAgentExecutionSessionId(dictOf(params?.judgment).message);
+  const prompt = buildAgentExecutionPrompt(params);
+  const result = await runCommand(
+    OPENCLAW_BIN,
+    [
+      "agent",
+      "--local",
+      "--session-id",
+      sessionId,
+      "--message",
+      prompt,
+      "--timeout",
+      String(OPENCLAW_TIMEOUT_SECONDS),
+      "--json",
+    ],
+    {
+      cwd: WORKSPACE,
+      env: {
+        ...process.env,
+        NO_COLOR: "1",
+        OPENCLAW_STATE_DIR: runtimeConfig.stateDir,
+        OPENCLAW_CONFIG_PATH: runtimeConfig.configPath,
+      },
+    },
+  );
+
+  if (result.code !== 0) {
+    throw new Error(`openclaw agent bridge failed: ${formatCommandError(result)}`);
+  }
+
+  const parsed = parseAgentCommandOutput(result.stdout);
+  return {
+    sessionId,
+    prompt,
+    replyText: extractAgentReplyText(parsed),
+    stdout: result.stdout,
+    stderr: result.stderr,
+    parsed,
+  };
+}
+
+export function __setAgentExecutionBridgeRunnerForTest(runner) {
+  agentExecutionBridgeRunner =
+    typeof runner === "function" ? runner : defaultAgentExecutionBridgeRunner;
+}
+
+export function __resetAgentExecutionBridgeRunnerForTest() {
+  agentExecutionBridgeRunner = defaultAgentExecutionBridgeRunner;
+}
+
 export function loadSavedCommunityState() {
   return loadJson(STATE_PATH, {}) || {};
 }
@@ -448,11 +859,25 @@ async function ensureGroup(state) {
   } catch (error) {
     throw new Error(`community entry group is unavailable (${GROUP_SLUG}): ${error.message}`);
   }
-  await request(`/groups/by-slug/${GROUP_SLUG}/join`, {
-    method: "POST",
-    token: state.token,
-    body: JSON.stringify({}),
-  });
+  try {
+    await request(`/groups/by-slug/${GROUP_SLUG}/join`, {
+      method: "POST",
+      token: state.token,
+      body: JSON.stringify({}),
+    });
+  } catch (error) {
+    const savedGroupId = firstText(state.groupId);
+    const savedGroupSlug = firstText(state.groupSlug);
+    if (savedGroupId === firstText(group.id) || savedGroupSlug === firstText(group.slug)) {
+      return {
+        ...state,
+        groupId: group.id,
+        groupSlug: group.slug,
+        groupName: group.name,
+      };
+    }
+    throw new Error(`community entry group join failed (${GROUP_SLUG}): ${error.message}`);
+  }
   return {
     ...state,
     groupId: group.id,
@@ -830,6 +1255,32 @@ export async function sendCommunityMessage(state, incomingMessage, payload) {
   });
 }
 
+export async function sendCanonicalCommunityMessage(state, incomingMessage, payload) {
+  const body = buildCommunityMessage(state, incomingMessage, payload);
+  console.log(JSON.stringify({ ok: true, outbound_structured_message: true, body }, null, 2));
+  const accepted = await request("/messages", {
+    method: "POST",
+    token: state.token,
+    headers: {
+      "X-Community-Skill-Channel": COMMUNITY_SKILL_CHANNEL,
+    },
+    body: JSON.stringify(body),
+  });
+  const canonical = await verifyCanonicalMessageVisible(state, {
+    groupId: body.group_id,
+    messageId: firstCanonicalUuid(accepted?.id),
+    idempotencyKey: firstText(body.extensions?.client_request_id, body.extensions?.outbound_correlation_id),
+    text: textOf(dictOf(body.content).text),
+    attempts: CANONICAL_EFFECT_ATTEMPTS,
+    delayMs: CANONICAL_EFFECT_DELAY_MS,
+  });
+  return {
+    accepted,
+    canonical: canonical.message,
+    requestBody: body,
+  };
+}
+
 export function handleProtocolViolation(state, payload) {
   const record = {
     received_at: new Date().toISOString(),
@@ -905,6 +1356,55 @@ function isInternalNonIntake(eventType) {
   );
 }
 
+async function maybeExecuteAgentBridge(state, event, judgment, protocolMount) {
+  const recommendation = dictOf(judgment?.recommendation);
+  if (firstText(recommendation.mode) !== "needs_agent_judgment") {
+    return null;
+  }
+
+  const bridgeResult = await agentExecutionBridgeRunner({
+    state,
+    event,
+    judgment,
+    protocolMount,
+  });
+  const replyText = firstText(bridgeResult?.replyText);
+  if (!replyText || replyText === "NO_REPLY") {
+    return {
+      executed: true,
+      reply_text: null,
+      bridge: {
+        session_id: firstText(bridgeResult?.sessionId) || null,
+      },
+    };
+  }
+
+  const outbound = await sendCanonicalCommunityMessage(state, judgment.message, {
+    group_id: firstText(dictOf(judgment.message).group_id, state?.groupId),
+    message_type: "analysis",
+    content: {
+      text: replyText,
+      metadata: {
+        execution_bridge: "openclaw_local_agent",
+        openclaw_session_id: firstText(bridgeResult?.sessionId) || null,
+        inbound_message_id: firstText(dictOf(judgment.message).id) || null,
+        runtime_obligation: firstText(dictOf(judgment.obligation).obligation) || null,
+        runtime_recommendation_mode: firstText(recommendation.mode) || null,
+      },
+    },
+  });
+
+  return {
+    executed: true,
+    reply_text: replyText,
+    bridge: {
+      session_id: firstText(bridgeResult?.sessionId) || null,
+    },
+    delivery: outbound.accepted || null,
+    canonical: outbound.canonical || null,
+  };
+}
+
 export async function receiveCommunityEvent(state, event) {
   const eventType = firstText(event?.event?.event_type, event?.event_type);
   if (isInternalNonIntake(eventType)) {
@@ -939,12 +1439,13 @@ export async function receiveCommunityEvent(state, event) {
       protocol_mount: protocolMount,
     },
   );
+  const outbound = await maybeExecuteAgentBridge(state, event, judgment, protocolMount);
   return {
     handled: true,
     hot_path_role: "judgment_only",
     judgment,
     protocol_mount: protocolMount,
-    outbound: null,
+    outbound,
   };
 }
 
@@ -987,6 +1488,7 @@ async function handleManualSend(state, payload) {
 }
 
 export async function startCommunityIntegration() {
+  const runtimeModelState = ensureRuntimeModelInheritance();
   let state = await connectToCommunity(loadSavedCommunityState());
   const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && req.url === "/healthz") {
@@ -1001,6 +1503,7 @@ export async function startCommunityIntegration() {
           runtimeRole: "judgment_only",
           skillRole: "onboarding_protocol_mount_transport",
           stateHome: STATE_HOME,
+          modelInheritance: loadRuntimeModelState(),
         }),
       );
       return;
@@ -1072,6 +1575,7 @@ export async function startCommunityIntegration() {
             runtimeRole: "judgment_only",
             skillRole: "onboarding_protocol_mount_transport",
             stateHome: STATE_HOME,
+            modelInheritanceValid: Boolean(runtimeModelState?.inheritance_valid),
           },
           null,
           2,
@@ -1095,6 +1599,7 @@ export async function startCommunityIntegration() {
           runtimeRole: "judgment_only",
           skillRole: "onboarding_protocol_mount_transport",
           stateHome: STATE_HOME,
+          modelInheritanceValid: Boolean(runtimeModelState?.inheritance_valid),
         },
         null,
         2,

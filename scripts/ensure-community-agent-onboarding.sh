@@ -28,11 +28,11 @@ else
 fi
 ASSETS_DIR="${TEMPLATE_HOME}/assets"
 STATE_PATH="${TEMPLATE_HOME}/state/community-webhook-state.json"
+RUNTIME_MODEL_STATE_PATH="${TEMPLATE_HOME}/state/community-model-runtime.json"
 ENV_FILE="${STATE_DIR}/community-agent.env"
 BOOTSTRAP_METADATA="${STATE_DIR}/community-agent.bootstrap.json"
 BOOTSTRAP_CONFIG="${STATE_DIR}/community-bootstrap.env"
 BUNDLED_BOOTSTRAP_CONFIG="${SKILL_ROOT}/community-bootstrap.env"
-INGRESS_SERVICE_NAME="${COMMUNITY_INGRESS_SERVICE_NAME:-openclaw-community-ingress.service}"
 NODE_BIN="$(command -v node || true)"
 
 if [[ -z "${NODE_BIN}" ]]; then
@@ -162,18 +162,6 @@ first_non_empty() {
   printf '%s' ""
 }
 
-resolve_model_base_url() {
-  first_non_empty "${MODEL_BASE_URL:-}" "${OPENAI_BASE_URL:-}" "${OPENAI_API_BASE:-}" "${LLM_BASE_URL:-}"
-}
-
-resolve_model_api_key() {
-  first_non_empty "${MODEL_API_KEY:-}" "${OPENAI_API_KEY:-}" "${LLM_API_KEY:-}"
-}
-
-resolve_model_id() {
-  first_non_empty "${MODEL_ID:-}" "${OPENAI_MODEL:-}" "${OPENAI_MODEL_ID:-}" "${DEFAULT_MODEL:-}" "${MODEL:-}"
-}
-
 listener_pid_8848() {
   if command -v ss >/dev/null 2>&1; then
     ss -ltnp '( sport = :8848 )' 2>/dev/null | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | head -n 1
@@ -268,6 +256,54 @@ PY
   return 1
 }
 
+wait_for_runtime_model_state() {
+  local state_path="${1}"
+  local expected_pid="${2}"
+  local attempts="${3:-240}"
+  local delay="${4:-0.5}"
+  local i
+  for ((i=1; i<=attempts; i+=1)); do
+    if python3 - "${state_path}" "${expected_pid}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+expected_pid = str(sys.argv[2]).strip()
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except (FileNotFoundError, json.JSONDecodeError):
+    raise SystemExit(1)
+
+if not data.get("ready"):
+    raise SystemExit(1)
+if not data.get("inheritance_valid"):
+    raise SystemExit(1)
+if data.get("framework") != "openclaw":
+    raise SystemExit(1)
+if not data.get("base_url"):
+    raise SystemExit(1)
+if not data.get("model_id"):
+    raise SystemExit(1)
+if not data.get("api_key_present"):
+    raise SystemExit(1)
+process_pid = str(data.get("process_pid") or "").strip()
+if expected_pid and expected_pid != "0" and process_pid != expected_pid:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+    then
+      MODEL_READY_POLLS="${i}"
+      MODEL_READY_SECONDS="$(awk "BEGIN { printf \"%.1f\", ${i} * ${delay} }")"
+      return 0
+    fi
+    sleep "${delay}"
+  done
+  MODEL_READY_POLLS="${attempts}"
+  MODEL_READY_SECONDS="$(awk "BEGIN { printf \"%.1f\", ${attempts} * ${delay} }")"
+  return 1
+}
+
 wait_for_agent_webhook() {
   local base_url="${1}"
   local state_path="${2}"
@@ -339,7 +375,20 @@ mkdir -p "${STATE_DIR}" "${ASSETS_DIR}" "${WORKSPACE_ROOT}/scripts"
 
 AGENT_SLUG="$(derive_agent_slug)"
 AGENT_NAME="${COMMUNITY_AGENT_NAME:-${AGENT_SLUG}}"
-INGRESS_HOME="${COMMUNITY_INGRESS_HOME:-/root/.openclaw/community-ingress}"
+SHARED_INGRESS_HOME="/root/.openclaw/community-ingress"
+SHARED_INGRESS_SERVICE_NAME="openclaw-community-ingress.service"
+LEGACY_INGRESS_SERVICE_NAME="${COMMUNITY_INGRESS_SERVICE_NAME:-}"
+if [[ -d "${SHARED_INGRESS_HOME}" ]] && systemctl cat "${SHARED_INGRESS_SERVICE_NAME}" >/dev/null 2>&1; then
+  INGRESS_HOME="${SHARED_INGRESS_HOME}"
+  INGRESS_SERVICE_NAME="${SHARED_INGRESS_SERVICE_NAME}"
+else
+  INGRESS_HOME="${COMMUNITY_INGRESS_HOME:-${SHARED_INGRESS_HOME}}"
+  INGRESS_SERVICE_NAME="${COMMUNITY_INGRESS_SERVICE_NAME:-${SHARED_INGRESS_SERVICE_NAME}}"
+fi
+MANAGE_INGRESS_SERVICE=1
+if [[ "${INGRESS_SERVICE_NAME}" == "${SHARED_INGRESS_SERVICE_NAME}" && "${INGRESS_HOME}" == "${SHARED_INGRESS_HOME}" ]]; then
+  MANAGE_INGRESS_SERVICE=0
+fi
 SOCKET_PATH="${COMMUNITY_AGENT_SOCKET_PATH:-$(compute_socket_path "${INGRESS_HOME}" "${AGENT_SLUG}")}"
 SERVICE_NAME="${COMMUNITY_SERVICE_NAME:-openclaw-community-webhook-${AGENT_SLUG}.service}"
 BASE_URL="${COMMUNITY_BASE_URL:-}"
@@ -373,80 +422,65 @@ import sys
 
 workspace_root = pathlib.Path(sys.argv[1]).resolve()
 
-def first_env(*names: str) -> str:
-    for name in names:
-        value = os.environ.get(name, "").strip()
-        if value:
-            return value
-    return ""
-
-base_url = first_env("MODEL_BASE_URL")
-api_key = first_env("MODEL_API_KEY")
-model_id = first_env("MODEL_ID")
+base_url = ""
+api_key = ""
+model_id = ""
 source = ""
 provider_name = ""
 
-if base_url and api_key and model_id:
-    source = "environment:MODEL_*"
-else:
-    candidates = []
-    explicit_home = os.environ.get("OPENCLAW_HOME", "").strip()
-    if explicit_home:
-        candidates.append(pathlib.Path(explicit_home))
-    if workspace_root.name == "workspace":
-        candidates.append(workspace_root.parent)
-    candidates.append(pathlib.Path("/root/.openclaw"))
+candidates = []
+explicit_home = os.environ.get("OPENCLAW_HOME", "").strip()
+if explicit_home:
+    candidates.append(pathlib.Path(explicit_home))
+if workspace_root.name == "workspace":
+    candidates.append(workspace_root.parent)
+candidates.append(pathlib.Path("/root/.openclaw"))
 
-    openclaw_home = None
-    for candidate in candidates:
-        if not candidate:
-            continue
-        resolved = candidate.resolve()
-        if resolved in candidates[: candidates.index(candidate)]:
-            continue
-        if (resolved / "openclaw.json").is_file():
-            openclaw_home = resolved
-            break
+seen = set()
+openclaw_home = None
+for candidate in candidates:
+    if not candidate:
+        continue
+    resolved = candidate.resolve()
+    if str(resolved) in seen:
+        continue
+    seen.add(str(resolved))
+    if (resolved / "openclaw.json").is_file():
+        openclaw_home = resolved
+        break
 
-    if openclaw_home is not None:
+if openclaw_home is not None:
+    openclaw_config = {}
+    models_config = {}
+    try:
+        openclaw_config = json.loads((openclaw_home / "openclaw.json").read_text(encoding="utf-8"))
+    except Exception:
         openclaw_config = {}
+    try:
+        models_config = json.loads((openclaw_home / "agents" / "main" / "agent" / "models.json").read_text(encoding="utf-8"))
+    except Exception:
         models_config = {}
-        try:
-            openclaw_config = json.loads((openclaw_home / "openclaw.json").read_text(encoding="utf-8"))
-        except Exception:
-            openclaw_config = {}
-        try:
-            models_config = json.loads((openclaw_home / "agents" / "main" / "agent" / "models.json").read_text(encoding="utf-8"))
-        except Exception:
-            models_config = {}
 
-        primary = str(
-            (((openclaw_config.get("agents") or {}).get("defaults") or {}).get("model") or {}).get("primary") or ""
-        ).strip()
-        if "/" in primary:
-            provider_name, primary_model_id = primary.split("/", 1)
-            model_id = model_id or primary_model_id.strip()
+    primary = str(
+        (((openclaw_config.get("agents") or {}).get("defaults") or {}).get("model") or {}).get("primary") or ""
+    ).strip()
+    if "/" in primary:
+        provider_name, primary_model_id = primary.split("/", 1)
+        model_id = primary_model_id.strip()
 
-        providers = {}
-        if isinstance(models_config.get("providers"), dict):
-            providers = models_config["providers"]
-        elif isinstance(((openclaw_config.get("models") or {}).get("providers")), dict):
-            providers = (openclaw_config.get("models") or {}).get("providers") or {}
+    providers = {}
+    if isinstance(models_config.get("providers"), dict):
+        providers = models_config["providers"]
+    elif isinstance(((openclaw_config.get("models") or {}).get("providers")), dict):
+        providers = (openclaw_config.get("models") or {}).get("providers") or {}
 
-        provider = providers.get(provider_name) if provider_name else None
-        if provider is None and len(providers) == 1:
-            provider_name, provider = next(iter(providers.items()))
-        if isinstance(provider, dict):
-            base_url = base_url or str(provider.get("baseUrl") or "").strip()
-            api_key = api_key or str(provider.get("apiKey") or "").strip()
-            source = source or f"{openclaw_home}/agents/main/agent/models.json + {openclaw_home}/openclaw.json"
-
-if not (base_url and api_key and model_id):
-    base_url = base_url or first_env("OPENAI_BASE_URL", "OPENAI_API_BASE", "LLM_BASE_URL")
-    api_key = api_key or first_env("OPENAI_API_KEY", "LLM_API_KEY")
-    model_id = model_id or first_env("OPENAI_MODEL", "OPENAI_MODEL_ID", "DEFAULT_MODEL", "MODEL")
-    if base_url and api_key and model_id:
-        source = source or "environment:OPENAI/LLM"
+    provider = providers.get(provider_name) if provider_name else None
+    if provider is None and len(providers) == 1:
+        provider_name, provider = next(iter(providers.items()))
+    if isinstance(provider, dict):
+        base_url = str(provider.get("baseUrl") or "").strip()
+        api_key = str(provider.get("apiKey") or "").strip()
+        source = f"{openclaw_home}/agents/main/agent/models.json + {openclaw_home}/openclaw.json"
 
 if base_url and api_key and model_id:
     print(f"RESOLVED_MODEL_BASE_URL={shlex.quote(base_url.rstrip('/'))}")
@@ -454,10 +488,18 @@ if base_url and api_key and model_id:
     print(f"RESOLVED_MODEL_ID={shlex.quote(model_id)}")
     print(f"RESOLVED_MODEL_SOURCE={shlex.quote(source or 'unknown')}")
     print(f"RESOLVED_MODEL_PROVIDER={shlex.quote(provider_name)}")
+    print("RESOLVED_MODEL_SOURCE_TYPE='formal_openclaw_config'")
 PY
 }
 
 eval "$(resolve_model_config)"
+
+if [[ -z "${RESOLVED_MODEL_BASE_URL:-}" || -z "${RESOLVED_MODEL_API_KEY:-}" || -z "${RESOLVED_MODEL_ID:-}" ]]; then
+  echo "formal OpenClaw model config could not be inherited from the local truth source; refusing to mark community skill ready" >&2
+  exit 1
+fi
+
+RESOLVED_MODEL_API_KEY_FINGERPRINT="$(hash_text "${RESOLVED_MODEL_API_KEY}")"
 
 SKILL_VERSION="$(python3 - "${SKILL_ROOT}" <<'PY'
 import json
@@ -484,13 +526,10 @@ print(data.get('release_ref', 'unknown'))
 PY
 )"
 
-RESOLVED_MODEL_BASE_URL="$(resolve_model_base_url)"
-RESOLVED_MODEL_API_KEY="$(resolve_model_api_key)"
-RESOLVED_MODEL_ID="$(resolve_model_id)"
-
 cat >"${ENV_FILE}" <<EOF
 COMMUNITY_BASE_URL=$(quote_env_value "${BASE_URL}")
 COMMUNITY_GROUP_SLUG=$(quote_env_value "${GROUP_SLUG}")
+COMMUNITY_INGRESS_SERVICE_NAME=$(quote_env_value "${INGRESS_SERVICE_NAME}")
 COMMUNITY_SERVICE_NAME=$(quote_env_value "${SERVICE_NAME}")
 COMMUNITY_AGENT_NAME=$(quote_env_value "${AGENT_NAME}")
 COMMUNITY_AGENT_DESCRIPTION=$(quote_env_value "${AGENT_DESCRIPTION}")
@@ -515,15 +554,23 @@ COMMUNITY_AGENT_AVATAR_TEXT=$(quote_env_value "${COMMUNITY_AGENT_AVATAR_TEXT:-}"
 COMMUNITY_AGENT_ACCENT_COLOR=$(quote_env_value "${COMMUNITY_AGENT_ACCENT_COLOR:-}")
 COMMUNITY_AGENT_EXPERTISE=$(quote_env_value "${COMMUNITY_AGENT_EXPERTISE:-}")
 COMMUNITY_MODEL_CONFIG_SOURCE=$(quote_env_value "${RESOLVED_MODEL_SOURCE:-}")
+COMMUNITY_MODEL_CONFIG_SOURCE_TYPE=$(quote_env_value "${RESOLVED_MODEL_SOURCE_TYPE:-formal_openclaw_config}")
+COMMUNITY_MODEL_CONFIG_MODE=$(quote_env_value "formal_inherited")
 COMMUNITY_MODEL_PROVIDER=$(quote_env_value "${RESOLVED_MODEL_PROVIDER:-}")
+COMMUNITY_MODEL_API_KEY_FINGERPRINT=$(quote_env_value "${RESOLVED_MODEL_API_KEY_FINGERPRINT:-}")
 MODEL_BASE_URL=$(quote_env_value "${RESOLVED_MODEL_BASE_URL:-}")
 MODEL_API_KEY=$(quote_env_value "${RESOLVED_MODEL_API_KEY:-}")
 MODEL_ID=$(quote_env_value "${RESOLVED_MODEL_ID:-}")
+COMMUNITY_OPENCLAW_STATE_DIR=$(quote_env_value "${STATE_DIR}/community-openclaw")
+COMMUNITY_OPENCLAW_CONFIG_PATH=$(quote_env_value "${STATE_DIR}/community-openclaw/openclaw.json")
+COMMUNITY_OPENCLAW_BIN=$(quote_env_value "$(command -v openclaw || true)")
+COMMUNITY_OPENCLAW_TIMEOUT_SECONDS=$(quote_env_value "${COMMUNITY_OPENCLAW_TIMEOUT_SECONDS:-120}")
 EOF
 
 cat >"${BOOTSTRAP_METADATA}" <<EOF
 {
   "agent_slug": "${AGENT_SLUG}",
+  "ingress_service_name": "${INGRESS_SERVICE_NAME}",
   "service_name": "${SERVICE_NAME}",
   "community_base_url": "${BASE_URL}",
   "ingress_home": "${INGRESS_HOME}",
@@ -531,6 +578,8 @@ cat >"${BOOTSTRAP_METADATA}" <<EOF
   "webhook_port": ${WEBHOOK_PORT},
   "webhook_path": "${WEBHOOK_PATH}",
   "send_path": "${SEND_PATH}",
+  "openclaw_state_dir": "${STATE_DIR}/community-openclaw",
+  "openclaw_config_path": "${STATE_DIR}/community-openclaw/openclaw.json",
   "skill_version": "${SKILL_VERSION}",
   "skill_release_ref": "${SKILL_RELEASE_REF}"
 }
@@ -578,12 +627,14 @@ INGRESS_ENV="${INGRESS_HOME}/community-ingress.env"
 INGRESS_SERVICE_PATH="/etc/systemd/system/${INGRESS_SERVICE_NAME}"
 AGENT_SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
 
+if [[ "${MANAGE_INGRESS_SERVICE}" == "1" ]]; then
 cat >"${INGRESS_ENV}" <<EOF
 COMMUNITY_INGRESS_HOME='${INGRESS_HOME}'
 COMMUNITY_ROUTE_REGISTRY='${ROUTE_REGISTRY}'
 COMMUNITY_INGRESS_HOST='0.0.0.0'
 COMMUNITY_INGRESS_PORT='8848'
 EOF
+fi
 
 if [[ ! -f "${ROUTE_REGISTRY}" ]]; then
   cat >"${ROUTE_REGISTRY}" <<'EOF'
@@ -621,6 +672,7 @@ with open(registry_path, "w", encoding="utf-8") as fh:
     fh.write("\n")
 PY
 
+if [[ "${MANAGE_INGRESS_SERVICE}" == "1" ]]; then
 cat >"${INGRESS_SERVICE_PATH}" <<UNIT
 [Unit]
 Description=OpenClaw Community Ingress
@@ -643,6 +695,7 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 UNIT
+fi
 
 cat >"${AGENT_SERVICE_PATH}" <<UNIT
 [Unit]
@@ -671,17 +724,38 @@ StandardError=journal
 WantedBy=multi-user.target
 UNIT
 
-chmod 644 "${INGRESS_SERVICE_PATH}" "${AGENT_SERVICE_PATH}"
+if [[ "${MANAGE_INGRESS_SERVICE}" == "1" ]]; then
+  chmod 644 "${INGRESS_SERVICE_PATH}"
+fi
+chmod 644 "${AGENT_SERVICE_PATH}"
 systemctl daemon-reload
-systemctl enable "${INGRESS_SERVICE_NAME}" "${SERVICE_NAME}" >/dev/null
+if [[ "${MANAGE_INGRESS_SERVICE}" == "1" ]]; then
+  systemctl enable "${INGRESS_SERVICE_NAME}" >/dev/null
+fi
+systemctl enable "${SERVICE_NAME}" >/dev/null
 stop_legacy_agent_listener_on_8848
-systemctl restart "${INGRESS_SERVICE_NAME}" || systemctl start "${INGRESS_SERVICE_NAME}"
+if [[ "${MANAGE_INGRESS_SERVICE}" == "0" ]] && [[ -n "${LEGACY_INGRESS_SERVICE_NAME}" ]] && [[ "${LEGACY_INGRESS_SERVICE_NAME}" != "${INGRESS_SERVICE_NAME}" ]]; then
+  systemctl disable --now "${LEGACY_INGRESS_SERVICE_NAME}" >/dev/null 2>&1 || true
+fi
+rm -f "${RUNTIME_MODEL_STATE_PATH}"
+if [[ "${MANAGE_INGRESS_SERVICE}" == "1" ]]; then
+  systemctl restart "${INGRESS_SERVICE_NAME}" || systemctl start "${INGRESS_SERVICE_NAME}"
+fi
 systemctl restart "${SERVICE_NAME}" || systemctl start "${SERVICE_NAME}"
 
 if wait_for_socket "${SOCKET_PATH}" "${COMMUNITY_SOCKET_WAIT_ATTEMPTS:-120}" "${COMMUNITY_SOCKET_WAIT_DELAY:-0.5}"; then
   echo "PASS socket ready after ${SOCKET_READY_SECONDS}s (${SOCKET_READY_POLLS} polls): ${SOCKET_PATH}"
 else
   echo "agent socket did not become ready during onboarding window after ${SOCKET_READY_SECONDS}s (${SOCKET_READY_POLLS} polls): ${SOCKET_PATH}" >&2
+  exit 1
+fi
+
+SERVICE_MAIN_PID="$(service_main_pid "${SERVICE_NAME}")"
+if wait_for_runtime_model_state "${RUNTIME_MODEL_STATE_PATH}" "${SERVICE_MAIN_PID}" "${COMMUNITY_MODEL_WAIT_ATTEMPTS:-240}" "${COMMUNITY_MODEL_WAIT_DELAY:-0.5}"; then
+  echo "PASS runtime model inheritance ready after ${MODEL_READY_SECONDS}s (${MODEL_READY_POLLS} polls): ${RUNTIME_MODEL_STATE_PATH}"
+else
+  echo "runtime model inheritance did not become ready during onboarding window after ${MODEL_READY_SECONDS}s (${MODEL_READY_POLLS} polls): ${RUNTIME_MODEL_STATE_PATH}" >&2
+  echo "expected the current ${SERVICE_NAME} main PID (${SERVICE_MAIN_PID}) to publish ready formal model inheritance state" >&2
   exit 1
 fi
 

@@ -167,7 +167,7 @@ function firstNonEmpty(...values) {
   return '';
 }
 
-function resolveOpenClawHome(workspaceRoot) {
+function resolveFormalOpenClawHome(workspaceRoot) {
   const candidates = [
     process.env.OPENCLAW_HOME,
     path.basename(workspaceRoot) === 'workspace' ? path.resolve(workspaceRoot, '..') : '',
@@ -186,21 +186,8 @@ function resolveOpenClawHome(workspaceRoot) {
   return null;
 }
 
-function resolveRealModelConfig(workspaceRoot) {
-  const explicitModel = {
-    baseUrl: firstNonEmpty(process.env.MODEL_BASE_URL),
-    apiKey: firstNonEmpty(process.env.MODEL_API_KEY),
-    modelId: firstNonEmpty(process.env.MODEL_ID),
-  };
-  if (explicitModel.baseUrl && explicitModel.apiKey && explicitModel.modelId) {
-    return {
-      ...explicitModel,
-      provider: '',
-      source: 'environment:MODEL_*',
-    };
-  }
-
-  const openclawHome = resolveOpenClawHome(workspaceRoot);
+function resolveFormalModelConfig(workspaceRoot) {
+  const openclawHome = resolveFormalOpenClawHome(workspaceRoot);
   if (openclawHome) {
     const openclawPath = path.join(openclawHome, 'openclaw.json');
     const modelsPath = path.join(openclawHome, 'agents', 'main', 'agent', 'models.json');
@@ -226,24 +213,21 @@ function resolveRealModelConfig(workspaceRoot) {
         apiKey,
         modelId: resolvedModelId,
         provider: providerName,
-        source: `${modelsPath} + ${openclawPath}`,
+        source: fs.existsSync(modelsPath) ? `${modelsPath} + ${openclawPath}` : openclawPath,
+        sourceType: 'formal_openclaw_config',
+        formalHome: openclawHome,
       };
     }
   }
-
-  const fallback = {
-    baseUrl: firstNonEmpty(process.env.OPENAI_BASE_URL, process.env.OPENAI_API_BASE, process.env.LLM_BASE_URL),
-    apiKey: firstNonEmpty(process.env.OPENAI_API_KEY, process.env.LLM_API_KEY),
-    modelId: firstNonEmpty(process.env.OPENAI_MODEL, process.env.OPENAI_MODEL_ID, process.env.DEFAULT_MODEL, process.env.MODEL),
-  };
-  if (fallback.baseUrl && fallback.apiKey && fallback.modelId) {
-    return {
-      ...fallback,
-      provider: '',
-      source: 'environment:OPENAI/LLM',
-    };
-  }
   return null;
+}
+
+function runtimeModelStatePath(stateHome) {
+  return path.join(stateHome, 'state', 'community-model-runtime.json');
+}
+
+function loadRuntimeModelStateSummary(stateHome) {
+  return loadJsonFile(runtimeModelStatePath(stateHome), {}) || {};
 }
 
 function detectPort8848Status(options = {}) {
@@ -456,16 +440,16 @@ function onboardingStateSummary() {
     path.join(stateHome, 'state', 'community-webhook-state.json'),
     {},
   ) || {};
+  const runtimeModel = loadRuntimeModelStateSummary(stateHome);
   const initialized = Boolean(
     runtimeState.token &&
       runtimeState.groupId &&
       runtimeState.profileCompleted &&
-      envValues.MODEL_BASE_URL &&
-      envValues.MODEL_API_KEY &&
-      envValues.MODEL_ID &&
-      envValues.COMMUNITY_WEBHOOK_PUBLIC_URL,
+      (runtimeState.webhookUrl || envValues.COMMUNITY_WEBHOOK_PUBLIC_URL) &&
+      runtimeModel.ready &&
+      runtimeModel.inheritance_valid,
   );
-  return { state, envValues, runtimeState, initialized };
+  return { state, envValues, runtimeState, runtimeModel, initialized };
 }
 
 function maybeRunOnboarding(runOptions = {}) {
@@ -745,21 +729,23 @@ function resolveFirstNonEmptyEnv(keys) {
 }
 
 function detectModelConfigSources(options = {}) {
-  const base = String(options['model-base-url'] || '').trim();
-  const key = String(options['model-api-key'] || '').trim();
-  const model = String(options['model-id'] || '').trim();
-  const envBase = resolveFirstNonEmptyEnv(["MODEL_BASE_URL", "OPENAI_BASE_URL", "OPENAI_API_BASE", "LLM_BASE_URL"]);
-  const envKey = resolveFirstNonEmptyEnv(["MODEL_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"]);
-  const envModel = resolveFirstNonEmptyEnv(["MODEL_ID", "OPENAI_MODEL", "OPENAI_MODEL_ID", "DEFAULT_MODEL", "MODEL"]);
+  const formal = resolveFormalModelConfig(resolveWorkspaceRoot());
   return {
-    base_url: base || envBase.value || '',
-    api_key: key || envKey.value || '',
-    model_id: model || envModel.value || '',
+    base_url: formal?.baseUrl || '',
+    api_key: formal?.apiKey || '',
+    model_id: formal?.modelId || '',
     sources: {
-      base_url: base ? 'cli' : (envBase.key || null),
-      api_key: key ? 'cli' : (envKey.key || null),
-      model_id: model ? 'cli' : (envModel.key || null),
+      base_url: formal?.source || null,
+      api_key: formal?.source || null,
+      model_id: formal?.source || null,
     },
+    formal_home: formal?.formalHome || null,
+    source_type: formal?.sourceType || null,
+    manual_inputs_ignored: Boolean(
+      String(options['model-base-url'] || '').trim() ||
+        String(options['model-api-key'] || '').trim() ||
+        String(options['model-id'] || '').trim(),
+    ),
   };
 }
 
@@ -805,7 +791,7 @@ function buildOnboardingPlan(mode, options = {}) {
       name: 'configure_model',
       status: hasModel ? 'ready' : 'blocked',
       detail: hasModel ? 'model_config_available' : 'model_config_missing',
-      prompt: hasModel ? 'Usable model config detected' : 'Provide model config or expose inheritable agent model config',
+      prompt: hasModel ? 'Inheritable formal OpenClaw model config detected' : 'Expose inheritable OpenClaw formal model config from the local truth source',
       model_sources: model.sources,
     },
     {
@@ -829,13 +815,13 @@ function buildOnboardingPlan(mode, options = {}) {
   const runnable = confirmPortOpen && hasModel && runRequested;
   const recommendedCommand = mode === 'auto'
     ? 'node ./scripts/community-agent-cli.mjs onboarding --mode auto --confirm-port-open true --run true'
-    : 'node ./scripts/community-agent-cli.mjs onboarding --mode guided --confirm-port-open true --model-base-url <url> --model-api-key <key> --model-id <model> --run true';
+    : 'node ./scripts/community-agent-cli.mjs onboarding --mode guided --confirm-port-open true --run true';
   const manualActions = [];
   if (!confirmPortOpen) {
     manualActions.push('Open port 8848 and make sure the community server can reach the webhook endpoint');
   }
   if (!hasModel) {
-    manualActions.push('Provide MODEL_BASE_URL / MODEL_API_KEY / MODEL_ID, or expose inheritable agent model config');
+    manualActions.push('Expose inheritable OpenClaw formal model config from the local agent truth source; snapshot env alone does not qualify');
   }
   if (!runRequested) {
     manualActions.push('After prerequisites are done, rerun onboarding with --run true');
@@ -860,6 +846,9 @@ async function cmdStatus() {
   const runtime = await getRuntime();
   trace('status.read_state');
   const state = runtime.loadSavedCommunityState();
+  const modelRuntime = typeof runtime.loadRuntimeModelState === 'function'
+    ? runtime.loadRuntimeModelState()
+    : loadRuntimeModelStateSummary(loadedContext?.stateHome || resolveSkillStateHome(resolveWorkspaceRoot()));
   console.log(
     JSON.stringify(
       {
@@ -876,6 +865,7 @@ async function cmdStatus() {
         workspaceRoot: loadedContext?.workspaceRoot || null,
         stateHome: loadedContext?.stateHome || null,
         envFile: loadedContext?.workspaceEnv || null,
+        modelRuntime,
       },
       null,
       2,
@@ -1104,6 +1094,7 @@ async function cmdProfileUpdate(options) {
 async function runOnboardingFlow(options) {
   const workspaceRoot = resolveWorkspaceRoot();
   const stateDir = path.join(workspaceRoot, '.openclaw');
+  const stateHome = resolveSkillStateHome(workspaceRoot);
   const savedEnv = parseJsonEnvFile(path.join(stateDir, 'community-agent.env'));
   const mode = String(options.mode || 'auto').trim().toLowerCase();
   if (!['auto', 'guided'].includes(mode)) {
@@ -1114,16 +1105,12 @@ async function runOnboardingFlow(options) {
   const profileMode =
     Object.keys(profileOverrides).length > 0 ? 'explicit_overrides' : 'sync_existing_identity';
   const portStatus = detectPort8848Status(options);
-  const manualModel = pruneEmpty({
-    baseUrl: options['model-base-url'],
-    apiKey: options['model-api-key'],
-    modelId: options['model-id'],
-  });
-  const autoModel = resolveRealModelConfig(workspaceRoot);
-  const modelConfig =
-    manualModel.baseUrl && manualModel.apiKey && manualModel.modelId
-      ? { ...manualModel, provider: '', source: 'manual_cli_input' }
-      : autoModel;
+  const modelConfig = resolveFormalModelConfig(workspaceRoot);
+  const manualModelInputDetected = Boolean(
+    String(options['model-base-url'] || '').trim() ||
+      String(options['model-api-key'] || '').trim() ||
+      String(options['model-id'] || '').trim(),
+  );
 
   const blockers = [];
   const steps = [];
@@ -1153,24 +1140,30 @@ async function runOnboardingFlow(options) {
   });
 
   if (!modelConfig) {
-    blockers.push('unable to resolve model configuration from OpenClaw runtime or manual inputs');
+    blockers.push('unable to inherit runnable OpenClaw model config from the local formal truth source');
   }
   addStep('configure_model', {
     status: modelConfig ? 'completed' : 'blocked',
     output: modelConfig
       ? {
           source: modelConfig.source,
+          source_type: modelConfig.sourceType || null,
+          formal_home: modelConfig.formalHome || null,
           provider: modelConfig.provider || null,
           base_url: modelConfig.baseUrl,
           model_id: modelConfig.modelId,
           api_key_present: Boolean(modelConfig.apiKey),
+          manual_inputs_ignored: manualModelInputDetected,
         }
       : {
           source: null,
+          source_type: null,
+          formal_home: null,
           provider: null,
           base_url: null,
           model_id: null,
           api_key_present: false,
+          manual_inputs_ignored: manualModelInputDetected,
         },
   });
 
@@ -1181,15 +1174,7 @@ async function runOnboardingFlow(options) {
   let onboardingResult = null;
   if (shouldRunOnboarding) {
     trace('onboarding.run_onboarding');
-    const onboardingEnv =
-      modelConfig.source === 'manual_cli_input'
-        ? {
-            MODEL_BASE_URL: modelConfig.baseUrl,
-            MODEL_API_KEY: modelConfig.apiKey,
-            MODEL_ID: modelConfig.modelId,
-          }
-        : {};
-    onboardingResult = maybeRunOnboarding({ env: onboardingEnv });
+    onboardingResult = maybeRunOnboarding();
   }
   addStep('run_onboarding', {
     status: shouldRunOnboarding ? 'completed' : 'blocked',
@@ -1227,6 +1212,7 @@ async function runOnboardingFlow(options) {
   });
 
   const envAfter = parseJsonEnvFile(path.join(stateDir, 'community-agent.env'));
+  const runtimeModel = loadRuntimeModelStateSummary(stateHome);
   return {
     ok: blockers.length === 0,
     command: 'onboarding',
@@ -1247,6 +1233,8 @@ async function runOnboardingFlow(options) {
       model_id: envAfter.MODEL_ID || null,
       model_source: envAfter.COMMUNITY_MODEL_CONFIG_SOURCE || null,
     },
+    runtime_model: runtimeModel,
+    manual_model_inputs_ignored: manualModelInputDetected,
   };
 }
 

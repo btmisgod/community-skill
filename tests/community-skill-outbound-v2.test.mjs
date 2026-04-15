@@ -12,6 +12,49 @@ process.env.COMMUNITY_BASE_URL = "http://community.example/api/v1";
 process.env.COMMUNITY_GROUP_SLUG = "public-lobby";
 process.env.COMMUNITY_TRANSPORT = "unix_socket";
 process.env.COMMUNITY_WEBHOOK_PUBLIC_URL = "http://agent.example/webhook/agent-self";
+process.env.OPENCLAW_HOME = path.join(tempRoot, ".openclaw-formal");
+
+function writeFormalOpenClawConfig(overrides = {}) {
+  const provider = overrides.provider || "formal-provider";
+  const modelId = overrides.modelId || "formal-model";
+  const baseUrl = overrides.baseUrl || "https://formal.example/api";
+  const apiKey = overrides.apiKey || "formal-key-1234";
+  const openclawHome = process.env.OPENCLAW_HOME;
+  fs.mkdirSync(path.join(openclawHome, "agents", "main", "agent"), { recursive: true });
+  fs.writeFileSync(
+    path.join(openclawHome, "openclaw.json"),
+    `${JSON.stringify({
+      agents: {
+        defaults: {
+          model: {
+            primary: `${provider}/${modelId}`,
+          },
+        },
+      },
+      models: {
+        providers: {
+          [provider]: {
+            baseUrl,
+            apiKey,
+          },
+        },
+      },
+    }, null, 2)}\n`,
+  );
+  fs.writeFileSync(
+    path.join(openclawHome, "agents", "main", "agent", "models.json"),
+    `${JSON.stringify({
+      providers: {
+        [provider]: {
+          baseUrl,
+          apiKey,
+        },
+      },
+    }, null, 2)}\n`,
+  );
+}
+
+writeFormalOpenClawConfig();
 
 const integration = await import(
   `${pathToFileURL(path.join(process.cwd(), "scripts", "community_integration.mjs")).href}?t=${Date.now()}`
@@ -35,6 +78,47 @@ const state = {
 
 test.after(() => {
   fs.rmSync(tempRoot, { recursive: true, force: true });
+});
+
+test.afterEach(() => {
+  integration.__resetAgentExecutionBridgeRunnerForTest();
+  delete process.env.MODEL_BASE_URL;
+  delete process.env.MODEL_API_KEY;
+  delete process.env.MODEL_ID;
+  fs.rmSync(path.join(process.env.COMMUNITY_STATE_HOME, "state", "community-model-runtime.json"), { force: true });
+  fs.rmSync(path.join(process.env.WORKSPACE_ROOT, ".openclaw", "community-openclaw"), { recursive: true, force: true });
+});
+
+test("formal OpenClaw model config wins over snapshot env", () => {
+  process.env.MODEL_BASE_URL = "https://env.example/api";
+  process.env.MODEL_API_KEY = "env-key";
+  process.env.MODEL_ID = "env-model";
+
+  const resolved = integration.resolveFormalOpenClawModelConfig();
+
+  assert.equal(resolved.baseUrl, "https://formal.example/api");
+  assert.equal(resolved.apiKey, "formal-key-1234");
+  assert.equal(resolved.modelId, "formal-model");
+  assert.equal(resolved.provider, "formal-provider");
+  assert.equal(resolved.sourceType, "formal_openclaw_config");
+});
+
+test("runtime model inheritance writes sanitized evidence for the running process", () => {
+  const runtimeModel = integration.ensureRuntimeModelInheritance();
+  const persisted = integration.loadRuntimeModelState();
+
+  assert.equal(runtimeModel.ready, true);
+  assert.equal(runtimeModel.inheritance_valid, true);
+  assert.equal(runtimeModel.base_url, "https://formal.example/api");
+  assert.equal(runtimeModel.model_id, "formal-model");
+  assert.equal(runtimeModel.api_key_present, true);
+  assert.equal(runtimeModel.api_key_fingerprint.length > 0, true);
+  assert.equal(runtimeModel.api_key_suffix, "1234");
+  assert.equal(runtimeModel.process_pid, process.pid);
+  assert.equal(runtimeModel.bridge_config_written, true);
+  assert.equal(persisted.source_type, "formal_openclaw_config");
+  assert.equal(persisted.api_key_fingerprint, runtimeModel.api_key_fingerprint);
+  assert.equal(persisted.api_key_fingerprint === "formal-key-1234", false);
 });
 
 test("buildCommunityMessage emits canonical message shape and preserves skill-side envelope packaging", () => {
@@ -401,12 +485,15 @@ test("verifyCanonicalMessageVisible requires persisted message materialization",
   }
 });
 
-test("receiveCommunityEvent mounts protocol context and does not auto-send replies", async () => {
+test("receiveCommunityEvent mounts protocol context and bridges required replies through local agent execution", async () => {
   const calls = [];
+  const sent = [];
   const originalFetch = global.fetch;
   global.fetch = async (url, options = {}) => {
-    const pathname = new URL(String(url)).pathname;
-    calls.push(pathname);
+    const parsedUrl = new URL(String(url));
+    const pathname = parsedUrl.pathname;
+    const requestKey = `${parsedUrl.pathname}${parsedUrl.search}`;
+    calls.push(requestKey);
     if (pathname === "/api/v1/protocol/context") {
       return {
         ok: true,
@@ -450,13 +537,60 @@ test("receiveCommunityEvent mounts protocol context and does not auto-send repli
         },
       };
     }
+    if (pathname === "/api/v1/messages" && parsedUrl.search) {
+      return {
+        ok: true,
+        async text() {
+          return JSON.stringify({
+            success: true,
+            data: {
+              items: [
+                {
+                  id: TARGET_ID,
+                  group_id: GROUP_ID,
+                  content: { text: "BRIDGED_REPLY_OK" },
+                  extensions: {
+                    client_request_id: sent[0]?.extensions?.client_request_id || "bridge-req",
+                    outbound_correlation_id: sent[0]?.extensions?.outbound_correlation_id || "bridge-corr",
+                    custom: {
+                      execution_bridge: "openclaw_local_agent",
+                    },
+                  },
+                },
+              ],
+            },
+          });
+        },
+      };
+    }
     if (pathname === "/api/v1/messages") {
-      throw new Error("receiveCommunityEvent must not auto-post outbound replies");
+      sent.push(JSON.parse(options.body));
+      return {
+        ok: true,
+        async text() {
+          return JSON.stringify({
+            success: true,
+            data: {
+              id: TARGET_ID,
+              group_id: GROUP_ID,
+            },
+          });
+        },
+      };
     }
     throw new Error(`unexpected fetch: ${pathname}`);
   };
 
   try {
+    integration.__setAgentExecutionBridgeRunnerForTest(async ({ judgment, protocolMount }) => {
+      assert.equal(judgment.obligation.obligation, "required");
+      assert.equal(protocolMount.agent_protocol.protocol_version, "ACP-003");
+      return {
+        sessionId: "bridge-session-1",
+        replyText: "BRIDGED_REPLY_OK",
+      };
+    });
+
     const result = await integration.receiveCommunityEvent(state, {
       event: {
         event_type: "message.posted",
@@ -494,11 +628,17 @@ test("receiveCommunityEvent mounts protocol context and does not auto-send repli
     assert.equal(result.hot_path_role, "judgment_only");
     assert.equal(result.judgment.category, "run");
     assert.equal(result.judgment.obligation.obligation, "required");
-    assert.equal(result.outbound, null);
+    assert.equal(result.outbound.reply_text, "BRIDGED_REPLY_OK");
+    assert.equal(result.outbound.canonical.id, TARGET_ID);
     assert.equal(result.protocol_mount.agent_protocol.protocol_version, "ACP-003");
     assert.ok(calls.includes("/api/v1/protocol/context"));
     assert.ok(calls.includes(`/api/v1/groups/${GROUP_ID}/protocol`));
     assert.ok(calls.includes(`/api/v1/groups/${GROUP_ID}/context`));
+    assert.ok(calls.includes(`/api/v1/messages?group_id=${GROUP_ID}&limit=100&offset=0`));
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].content.text, "BRIDGED_REPLY_OK");
+    assert.equal(sent[0].relations.thread_id, THREAD_ID);
+    assert.equal(sent[0].relations.parent_message_id, PARENT_ID);
   } finally {
     global.fetch = originalFetch;
   }

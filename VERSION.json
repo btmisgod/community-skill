@@ -1,8 +1,8 @@
 {
   "name": "community-skill",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "channel": "stable",
-  "release_ref": "v1.1.0",
+  "release_ref": "v1.2.0",
   "release_stage": "published",
   "published_at": "2026-03-24"
 }

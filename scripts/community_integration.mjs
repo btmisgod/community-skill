@@ -506,7 +506,19 @@ export async function listCommunityMessages(state, options = {}) {
   }
   const limit = Number(options.limit || 100);
   const offset = Number(options.offset || 0);
-  return request(`/messages?group_id=${encodeURIComponent(groupId)}&limit=${limit}&offset=${offset}`, {
+  const params = new URLSearchParams({
+    group_id: groupId,
+    limit: String(limit),
+    offset: String(offset),
+  });
+  const threadId = firstCanonicalUuid(options.threadId);
+  if (threadId) {
+    params.set("thread_id", threadId);
+  }
+  if (typeof options.newestFirst === "boolean") {
+    params.set("newest_first", options.newestFirst ? "true" : "false");
+  }
+  return request(`/messages?${params.toString()}`, {
     method: "GET",
     token: state?.token,
   });
@@ -529,6 +541,7 @@ export async function verifyCanonicalMessageVisible(state, options = {}) {
       groupId,
       limit: Number(options.limit || 100),
       offset: 0,
+      newestFirst: true,
     });
     const matched = listOf(response?.items).find((item) => {
       if (!item || typeof item !== "object") {

@@ -115,6 +115,7 @@ test("runtime model inheritance writes sanitized evidence for the running proces
   assert.equal(runtimeModel.api_key_fingerprint.length > 0, true);
   assert.equal(runtimeModel.api_key_suffix, "1234");
   assert.equal(runtimeModel.process_pid, process.pid);
+  assert.equal(runtimeModel.formal_home, process.env.OPENCLAW_HOME);
   assert.equal(runtimeModel.bridge_config_written, true);
   assert.equal(persisted.source_type, "formal_openclaw_config");
   assert.equal(persisted.api_key_fingerprint, runtimeModel.api_key_fingerprint);
@@ -439,7 +440,9 @@ test("connectToCommunity persists token and group state before session sync comp
 
 test("verifyCanonicalMessageVisible requires persisted message materialization", async () => {
   const originalFetch = global.fetch;
+  const observedUrls = [];
   global.fetch = async (url) => {
+    observedUrls.push(String(url));
     const pathname = new URL(String(url)).pathname;
     if (pathname === "/api/v1/messages") {
       return {
@@ -480,6 +483,7 @@ test("verifyCanonicalMessageVisible requires persisted message materialization",
 
     assert.equal(result.ok, true);
     assert.equal(result.message.id, PARENT_ID);
+    assert.equal(new URL(observedUrls[0]).searchParams.get("newest_first"), "true");
   } finally {
     global.fetch = originalFetch;
   }
@@ -634,7 +638,7 @@ test("receiveCommunityEvent mounts protocol context and bridges required replies
     assert.ok(calls.includes("/api/v1/protocol/context"));
     assert.ok(calls.includes(`/api/v1/groups/${GROUP_ID}/protocol`));
     assert.ok(calls.includes(`/api/v1/groups/${GROUP_ID}/context`));
-    assert.ok(calls.includes(`/api/v1/messages?group_id=${GROUP_ID}&limit=100&offset=0`));
+    assert.ok(calls.includes(`/api/v1/messages?group_id=${GROUP_ID}&limit=100&offset=0&newest_first=true`));
     assert.equal(sent.length, 1);
     assert.equal(sent[0].content.text, "BRIDGED_REPLY_OK");
     assert.equal(sent[0].relations.thread_id, THREAD_ID);

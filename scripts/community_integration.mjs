@@ -579,6 +579,39 @@ export async function verifyCanonicalMessageVisible(state, options = {}) {
   throw new Error(`canonical effect not observed for group ${groupId}`);
 }
 
+function canonicalRequestIds(message) {
+  const extensions = dictOf(message?.extensions);
+  const custom = dictOf(extensions.custom);
+  return [
+    extensions.client_request_id,
+    extensions.outbound_correlation_id,
+    custom.idempotency_key,
+  ]
+    .map((value) => textOf(value))
+    .filter(Boolean);
+}
+
+function matchesCanonicalMessage(message, options = {}) {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  const groupId = firstText(options.groupId);
+  const messageId = firstCanonicalUuid(options.messageId);
+  const idempotencyKey = firstText(options.idempotencyKey, options.clientRequestId);
+  const expectedText = firstText(options.text);
+
+  if (groupId && textOf(message.group_id) !== groupId) {
+    return false;
+  }
+  if (messageId && textOf(message.id) === messageId) {
+    return true;
+  }
+  if (idempotencyKey && canonicalRequestIds(message).includes(idempotencyKey)) {
+    return true;
+  }
+  return Boolean(expectedText) && textOf(dictOf(message.content).text) === expectedText;
+}
+
 export function ensureLocalOpenClawRuntimeConfig(modelConfig = null) {
   const resolvedModelConfig = modelConfig || resolveFormalOpenClawModelConfig(WORKSPACE);
   const modelId = textOf(resolvedModelConfig?.modelId);
@@ -1279,6 +1312,22 @@ export async function sendCanonicalCommunityMessage(state, incomingMessage, payl
     },
     body: JSON.stringify(body),
   });
+  if (
+    matchesCanonicalMessage(accepted, {
+      groupId: body.group_id,
+      messageId: firstCanonicalUuid(accepted?.id),
+      idempotencyKey: firstText(body.extensions?.client_request_id, body.extensions?.outbound_correlation_id),
+      text: textOf(dictOf(body.content).text),
+    })
+  ) {
+    return {
+      accepted,
+      canonical: accepted,
+      canonical_source: "accepted_response",
+      canonical_attempts: 0,
+      requestBody: body,
+    };
+  }
   const canonical = await verifyCanonicalMessageVisible(state, {
     groupId: body.group_id,
     messageId: firstCanonicalUuid(accepted?.id),
@@ -1290,6 +1339,8 @@ export async function sendCanonicalCommunityMessage(state, incomingMessage, payl
   return {
     accepted,
     canonical: canonical.message,
+    canonical_source: "messages_query",
+    canonical_attempts: Number(canonical?.attempts || 0),
     requestBody: body,
   };
 }

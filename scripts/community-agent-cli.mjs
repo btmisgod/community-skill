@@ -911,9 +911,23 @@ async function cmdSend(options) {
   };
 
   const existing = recentSendCacheEntry(idempotencyKey);
-  if (existing && (existing.state === "pending" || existing.state === "sent")) {
+  if (existing && (existing.state === "pending" || existing.state === "sent" || existing.state === "accepted")) {
     trace("send.success_condition_satisfied", { duplicate: true, idempotencyKey, cacheState: existing.state });
-    console.log(JSON.stringify({ ok: true, command: "send", duplicate: true, idempotencyKey, cacheState: existing.state }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          ok: true,
+          command: "send",
+          duplicate: true,
+          idempotencyKey,
+          cacheState: existing.state,
+          communityMessageId: existing.communityMessageId || null,
+          canonicalPending: Boolean(existing.canonicalPending),
+        },
+        null,
+        2,
+      ),
+    );
     trace("send.command_exit");
     return;
   }
@@ -925,25 +939,90 @@ async function cmdSend(options) {
   });
 
   trace("send.request_start", { groupId: payload.group_id, messageType: payload.message_type, idempotencyKey });
+  let acceptedResult = null;
   try {
-    const result = await withSendRequestIdempotency(idempotencyKey, () => runtime.sendCommunityMessage(state, null, payload));
-    trace("send.request_response_received", { idempotencyKey });
-    const canonicalEffect = await runtime.verifyCanonicalMessageVisible(state, {
-      groupId: payload.group_id,
-      messageId: result?.id || null,
+    let canonicalEffect = null;
+    if (typeof runtime.sendCanonicalCommunityMessage === "function") {
+      const delivery = await withSendRequestIdempotency(idempotencyKey, () =>
+        runtime.sendCanonicalCommunityMessage(state, null, payload),
+      );
+      acceptedResult = delivery?.accepted || null;
+      if (delivery?.canonical) {
+        canonicalEffect = {
+          ok: true,
+          attempts: Number(delivery?.canonical_attempts || 0),
+          source: delivery?.canonical_source || "accepted_response",
+          message: delivery.canonical,
+        };
+      }
+    } else {
+      acceptedResult = await withSendRequestIdempotency(idempotencyKey, () =>
+        runtime.sendCommunityMessage(state, null, payload),
+      );
+    }
+    trace("send.request_response_received", {
       idempotencyKey,
-      text,
+      communityMessageId: acceptedResult?.id || null,
     });
+    if (!canonicalEffect) {
+      canonicalEffect = await runtime.verifyCanonicalMessageVisible(state, {
+        groupId: payload.group_id,
+        messageId: acceptedResult?.id || null,
+        idempotencyKey,
+        text,
+      });
+    }
     upsertSendCacheEntry(idempotencyKey, {
       state: "sent",
       groupId: payload.group_id,
       messageType: payload.message_type,
-      communityMessageId: canonicalEffect?.message?.id || result?.id || null,
+      communityMessageId: canonicalEffect?.message?.id || acceptedResult?.id || null,
+      canonicalPending: false,
     });
     trace("send.success_condition_satisfied", { idempotencyKey });
-    console.log(JSON.stringify({ ok: true, command: "send", result, idempotencyKey, canonicalEffect }, null, 2));
+    console.log(
+      JSON.stringify(
+        { ok: true, command: "send", result: acceptedResult, idempotencyKey, canonicalEffect },
+        null,
+        2,
+      ),
+    );
     trace("send.command_exit");
   } catch (error) {
+    if (acceptedResult?.id && /canonical effect not observed/i.test(String(error?.message || ""))) {
+      upsertSendCacheEntry(idempotencyKey, {
+        state: "accepted",
+        groupId: payload.group_id,
+        messageType: payload.message_type,
+        communityMessageId: acceptedResult.id,
+        canonicalPending: true,
+        error: error.message,
+      });
+      trace("send.accepted_but_canonical_pending", {
+        idempotencyKey,
+        communityMessageId: acceptedResult.id,
+      });
+      console.log(
+        JSON.stringify(
+          {
+            ok: true,
+            command: "send",
+            result: acceptedResult,
+            idempotencyKey,
+            canonicalEffect: {
+              ok: false,
+              pending: true,
+              error: error.message,
+              messageId: acceptedResult.id,
+            },
+          },
+          null,
+          2,
+        ),
+      );
+      trace("send.command_exit");
+      return;
+    }
     upsertSendCacheEntry(idempotencyKey, {
       state: "uncertain",
       error: error.message,

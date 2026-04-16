@@ -209,6 +209,55 @@ test("sendCommunityMessage posts canonical body to /messages", async () => {
   }
 });
 
+test("sendCanonicalCommunityMessage accepts canonical POST responses without a second visibility poll", async () => {
+  const sent = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    sent.push({ url: String(url), body: JSON.parse(options.body) });
+    return {
+      ok: true,
+      async text() {
+        return JSON.stringify({
+          success: true,
+          data: {
+            id: PARENT_ID,
+            group_id: GROUP_ID,
+            content: { text: "Please take a look." },
+            extensions: {
+              client_request_id: sent[0]?.body?.extensions?.client_request_id,
+              outbound_correlation_id: sent[0]?.body?.extensions?.outbound_correlation_id,
+              custom: {
+                idempotency_key: sent[0]?.body?.extensions?.custom?.idempotency_key,
+              },
+            },
+          },
+        });
+      },
+    };
+  };
+
+  try {
+    const result = await integration.sendCanonicalCommunityMessage(state, null, {
+      group_id: GROUP_ID,
+      content: {
+        text: "Please take a look.",
+        metadata: {
+          idempotency_key: "idem-accepted-response",
+        },
+      },
+      message_type: "analysis",
+    });
+
+    assert.equal(result.accepted.id, PARENT_ID);
+    assert.equal(result.canonical.id, PARENT_ID);
+    assert.equal(result.canonical_source, "accepted_response");
+    assert.equal(result.canonical_attempts, 0);
+    assert.equal(sent.length, 1);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test("connectToCommunity syncs session state and registers webhook even for unix_socket ingress", async () => {
   const calls = [];
   const originalFetch = global.fetch;
@@ -634,11 +683,11 @@ test("receiveCommunityEvent mounts protocol context and bridges required replies
     assert.equal(result.judgment.obligation.obligation, "required");
     assert.equal(result.outbound.reply_text, "BRIDGED_REPLY_OK");
     assert.equal(result.outbound.canonical.id, TARGET_ID);
+    assert.equal(result.outbound.delivery.id, TARGET_ID);
     assert.equal(result.protocol_mount.agent_protocol.protocol_version, "ACP-003");
     assert.ok(calls.includes("/api/v1/protocol/context"));
     assert.ok(calls.includes(`/api/v1/groups/${GROUP_ID}/protocol`));
     assert.ok(calls.includes(`/api/v1/groups/${GROUP_ID}/context`));
-    assert.ok(calls.includes(`/api/v1/messages?group_id=${GROUP_ID}&limit=100&offset=0&newest_first=true`));
     assert.equal(sent.length, 1);
     assert.equal(sent[0].content.text, "BRIDGED_REPLY_OK");
     assert.equal(sent[0].relations.thread_id, THREAD_ID);

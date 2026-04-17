@@ -23,6 +23,39 @@ BUNDLED_BOOTSTRAP_CONFIG="${SKILL_ROOT}/community-bootstrap.env"
 INGRESS_SERVICE_NAME="${COMMUNITY_INGRESS_SERVICE_NAME:-openclaw-community-ingress.service}"
 NODE_BIN="$(command -v node || true)"
 
+PRESERVED_ENV_OVERRIDES=()
+ORIGINAL_MODEL_BASE_URL_SET="${MODEL_BASE_URL+x}"
+ORIGINAL_MODEL_API_KEY_SET="${MODEL_API_KEY+x}"
+ORIGINAL_MODEL_ID_SET="${MODEL_ID+x}"
+for name in \
+  COMMUNITY_BASE_URL \
+  COMMUNITY_GROUP_SLUG \
+  COMMUNITY_AGENT_NAME \
+  COMMUNITY_AGENT_HANDLE \
+  COMMUNITY_AGENT_SOCKET_PATH \
+  COMMUNITY_SERVICE_NAME \
+  COMMUNITY_WEBHOOK_PATH \
+  COMMUNITY_SEND_PATH \
+  COMMUNITY_HUMAN_ACCESS_TOKEN \
+  COMMUNITY_ADMIN_ACCESS_TOKEN \
+  COMMUNITY_WEBHOOK_PUBLIC_URL \
+  COMMUNITY_WEBHOOK_PUBLIC_HOST \
+  COMMUNITY_WEBHOOK_HOST \
+  COMMUNITY_WEBHOOK_PORT \
+  COMMUNITY_INGRESS_HOME \
+  COMMUNITY_AGENT_DISPLAY_NAME \
+  COMMUNITY_AGENT_DESCRIPTION \
+  COMMUNITY_AGENT_IDENTITY \
+  COMMUNITY_AGENT_TAGLINE \
+  MODEL_BASE_URL \
+  MODEL_API_KEY \
+  MODEL_ID
+do
+  if [[ "${!name+x}" == "x" ]]; then
+    PRESERVED_ENV_OVERRIDES+=("${name}=${!name}")
+  fi
+done
+
 if [[ -z "${NODE_BIN}" ]]; then
   echo "node not found in PATH" >&2
   exit 1
@@ -46,6 +79,23 @@ fi
 if [[ -f "${ENV_FILE}" ]]; then
   # shellcheck disable=SC1090
   source "${ENV_FILE}"
+fi
+
+for item in "${PRESERVED_ENV_OVERRIDES[@]}"; do
+  name="${item%%=*}"
+  value="${item#*=}"
+  printf -v "${name}" '%s' "${value}"
+  export "${name}"
+done
+
+if [[ -z "${ORIGINAL_MODEL_BASE_URL_SET:-}" ]]; then
+  unset MODEL_BASE_URL || true
+fi
+if [[ -z "${ORIGINAL_MODEL_API_KEY_SET:-}" ]]; then
+  unset MODEL_API_KEY || true
+fi
+if [[ -z "${ORIGINAL_MODEL_ID_SET:-}" ]]; then
+  unset MODEL_ID || true
 fi
 
 derive_agent_slug() {
@@ -419,9 +469,9 @@ print(data.get('release_ref', 'unknown'))
 PY
 )"
 
-RESOLVED_MODEL_BASE_URL="$(resolve_model_base_url)"
-RESOLVED_MODEL_API_KEY="$(resolve_model_api_key)"
-RESOLVED_MODEL_ID="$(resolve_model_id)"
+RESOLVED_MODEL_BASE_URL="${RESOLVED_MODEL_BASE_URL:-$(resolve_model_base_url)}"
+RESOLVED_MODEL_API_KEY="${RESOLVED_MODEL_API_KEY:-$(resolve_model_api_key)}"
+RESOLVED_MODEL_ID="${RESOLVED_MODEL_ID:-$(resolve_model_id)}"
 
 cat >"${ENV_FILE}" <<EOF
 COMMUNITY_BASE_URL=$(quote_env_value "${BASE_URL}")
@@ -453,6 +503,7 @@ COMMUNITY_MODEL_PROVIDER=$(quote_env_value "${RESOLVED_MODEL_PROVIDER:-}")
 MODEL_BASE_URL=$(quote_env_value "${RESOLVED_MODEL_BASE_URL:-}")
 MODEL_API_KEY=$(quote_env_value "${RESOLVED_MODEL_API_KEY:-}")
 MODEL_ID=$(quote_env_value "${RESOLVED_MODEL_ID:-}")
+COMMUNITY_HUMAN_ACCESS_TOKEN=$(quote_env_value "${COMMUNITY_HUMAN_ACCESS_TOKEN:-${COMMUNITY_ADMIN_ACCESS_TOKEN:-}}")
 EOF
 
 cat >"${BOOTSTRAP_METADATA}" <<EOF

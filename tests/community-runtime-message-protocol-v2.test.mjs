@@ -212,6 +212,88 @@ test("group session update can opt into manager control-turn through adapter hoo
   assert.equal(result.context_group_id, "group-1");
 });
 
+test("built-in manager control-turn marks manager as required without peer scripting", async () => {
+  const runtimeState = {
+    ...state,
+    agentId: "manager-1",
+  };
+  const result = await runtime.handleRuntimeEvent(baseAdapter(), runtimeState, {
+    event: {
+      event_type: "group_session.updated",
+      payload: {
+        group_session: {
+          group_id: "group-1",
+          group_session_version: "group-session:v1",
+          current_stage: "cycle.start",
+          manager_agent_ids: ["manager-1"],
+          manager_control_turn: {
+            turn_id: "cycle.start:manager_done:group-session:v1",
+            turn_type: "server_manager_control_turn",
+            current_stage: "cycle.start",
+            required_agent_ids: ["manager-1"],
+            reason: "server_manager_control_turn",
+            activation_version: "group-session:v1",
+          },
+        },
+      },
+    },
+    entity: {
+      group_session: {
+        group_id: "group-1",
+        current_stage: "cycle.start",
+      },
+    },
+    group_id: "group-1",
+  });
+
+  assert.equal(result.category, "group_session");
+  assert.equal(result.obligation.obligation, "required");
+  assert.equal(result.obligation.reason, "server_manager_control_turn");
+  assert.equal(result.recommendation.mode, "needs_agent_judgment");
+  assert.equal(result.manager_control_turn.turn_type, "server_manager_control_turn");
+});
+
+test("built-in manager control-turn is deduped for the same turn id", async () => {
+  const runtimeState = {
+    ...state,
+    agentId: "manager-1",
+  };
+  const event = {
+    event: {
+      event_type: "group_session.updated",
+      payload: {
+        group_session: {
+          group_id: "group-1",
+          group_session_version: "group-session:v2",
+          current_stage: "cycle.start",
+          manager_control_turn: {
+            turn_id: "cycle.start:manager_done:group-session:v2",
+            turn_type: "server_manager_control_turn",
+            current_stage: "cycle.start",
+            required_agent_ids: ["manager-1"],
+            reason: "server_manager_control_turn",
+            activation_version: "group-session:v2",
+          },
+        },
+      },
+    },
+    entity: {
+      group_session: {
+        group_id: "group-1",
+        current_stage: "cycle.start",
+      },
+    },
+    group_id: "group-1",
+  };
+
+  const first = await runtime.handleRuntimeEvent(baseAdapter(), runtimeState, event);
+  const second = await runtime.handleRuntimeEvent(baseAdapter(), runtimeState, event);
+
+  assert.equal(first.obligation.obligation, "required");
+  assert.equal(second.obligation.obligation, "observe_only");
+  assert.equal(second.obligation.reason, "duplicate_server_manager_control_turn");
+});
+
 test("self message is observed only", async () => {
   const result = await runtime.handleRuntimeEvent(baseAdapter(), state, eventFor({
     id: "msg-4",

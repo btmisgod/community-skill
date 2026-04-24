@@ -52,6 +52,7 @@ const ENV_FILE_PATH = path.join(STATE_DIR, "community-agent.env");
 const STATE_PATH = path.join(TEMPLATE_HOME, "state", "community-webhook-state.json");
 const CHANNEL_CONTEXT_PATH = path.join(TEMPLATE_HOME, "state", "community-channel-contexts.json");
 const WORKFLOW_CONTRACT_PATH = path.join(TEMPLATE_HOME, "state", "community-workflow-contracts.json");
+const GROUP_SESSION_PATH = path.join(TEMPLATE_HOME, "state", "community-group-sessions.json");
 const PROTOCOL_VIOLATION_PATH = path.join(TEMPLATE_HOME, "state", "community-protocol-violations.json");
 const OUTBOUND_RECEIPTS_PATH = path.join(TEMPLATE_HOME, "state", "community-outbound-receipts.json");
 const OUTBOUND_DEBUG_PATH = path.join(TEMPLATE_HOME, "state", "community-outbound-debug.json");
@@ -99,6 +100,60 @@ function appendJsonArray(filePath, entry, limit = 100) {
   list.push(entry);
   saveJson(filePath, list.slice(-limit));
   return entry;
+}
+
+function loadGroupSessionStore() {
+  return loadJson(GROUP_SESSION_PATH, {}) || {};
+}
+
+function saveGroupSessionStore(store) {
+  saveJson(GROUP_SESSION_PATH, store || {});
+  return store || {};
+}
+
+export async function loadGroupSession(state, groupId, payload = null) {
+  const normalizedGroupId = String(groupId || "").trim();
+  if (!normalizedGroupId) {
+    return null;
+  }
+
+  const current = loadGroupSessionStore();
+  const entry = {
+    updated_at: new Date().toISOString(),
+    group_id: normalizedGroupId,
+    agent_id: state?.agentId || null,
+    payload: payload || null,
+  };
+
+  current[normalizedGroupId] = entry;
+  saveGroupSessionStore(current);
+  return entry;
+}
+
+export async function resolveGroupSessionObligation(state, groupId, payload, signals) {
+  const normalizedGroupId = String(groupId || "").trim();
+  if (!normalizedGroupId) {
+    return null;
+  }
+
+  const groupSession = payload?.group_session && typeof payload.group_session === "object" ? payload.group_session : {};
+  const controlTurnOptIn = Boolean(
+    groupSession.server_to_manager ||
+      groupSession.control_turn ||
+      groupSession.manager_control_turn ||
+      groupSession.opt_in,
+  );
+  if (!controlTurnOptIn) {
+    return null;
+  }
+
+  return {
+    obligation: "required",
+    reason: "server_to_manager_control_turn_opt_in",
+    group_id: normalizedGroupId,
+    agent_id: state?.agentId || null,
+    signals: signals || null,
+  };
 }
 
 function outboundRequestId() {
@@ -2403,9 +2458,11 @@ export async function receiveCommunityEvent(state, event) {
   const judgment = await runtimeModule.handleRuntimeEvent(
     {
       handleProtocolViolation,
+      loadGroupSession,
       loadWorkflowContract,
       loadGroupContext,
       loadChannelContext: loadGroupContext,
+      resolveGroupSessionObligation,
     },
     state,
     event,
@@ -2605,5 +2662,3 @@ export async function startCommunityIntegration() {
 
 
 export const loadChannelContext = loadGroupContext;
-
-

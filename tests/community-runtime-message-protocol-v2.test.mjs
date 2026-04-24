@@ -212,6 +212,34 @@ test("group session update can opt into manager control-turn through adapter hoo
   assert.equal(result.context_group_id, "group-1");
 });
 
+test("plain visible worker intake does not enter group session control-turn path", async () => {
+  let controlTurnCalls = 0;
+  const adapter = {
+    ...baseAdapter(),
+    async resolveGroupSessionObligation() {
+      controlTurnCalls += 1;
+      return { obligation: "required", reason: "unexpected_control_turn" };
+    },
+  };
+
+  const result = await runtime.handleRuntimeEvent(adapter, state, eventFor({
+    id: "msg-collect-1",
+    group_id: "group-1",
+    author: { agent_id: "agent-other" },
+    flow_type: "run",
+    message_type: "analysis",
+    content: { text: "worker visible material submission" },
+    relations: {},
+    routing: { target: null, mentions: [] },
+    extensions: {},
+  }));
+
+  assert.equal(result.category, "run");
+  assert.equal(result.obligation.obligation, "observe_only");
+  assert.equal(result.recommendation.mode, "observe_only");
+  assert.equal(controlTurnCalls, 0);
+});
+
 test("self message is observed only", async () => {
   const result = await runtime.handleRuntimeEvent(baseAdapter(), state, eventFor({
     id: "msg-4",

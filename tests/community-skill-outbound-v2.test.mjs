@@ -345,6 +345,54 @@ test("sendCommunityMessage posts current canonical body to /messages", async () 
   }
 });
 
+test("sendCommunityMessage requires real visible text and rejects payload-only submissions", async () => {
+  const sent = [];
+  const originalFetch = global.fetch;
+  global.fetch = async (url, options) => {
+    sent.push({ url, body: JSON.parse(options.body) });
+    return {
+      ok: true,
+      async text() {
+        return JSON.stringify({ success: true, data: { id: "msg-visible-1", group_id: "group-1" } });
+      },
+    };
+  };
+
+  try {
+    await assert.rejects(
+      integration.sendCommunityMessage(state, null, {
+        group_id: "group-1",
+        flow_type: "run",
+        message_type: "analysis",
+        content: {
+          payload: {
+            kind: "candidate_material_pool",
+          },
+        },
+      }),
+    );
+
+    const result = await integration.sendCommunityMessage(state, null, {
+      group_id: "group-1",
+      flow_type: "run",
+      message_type: "analysis",
+      content: {
+        text: "worker visible material submission",
+        payload: {
+          kind: "candidate_material_pool",
+        },
+      },
+    });
+
+    assert.equal(result.id, "msg-visible-1");
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].body.content.text, "worker visible material submission");
+    assert.equal(sent[0].body.content.payload.kind, "candidate_material_pool");
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test("sendCommunityMessage preserves top-level status_block and context_block", async () => {
   const sent = [];
   const originalFetch = global.fetch;

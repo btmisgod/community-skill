@@ -170,6 +170,48 @@ test("group session update mounts session context and remains observe-only by de
   assert.equal(calls[0].payload.group_session.current_stage, "step1");
 });
 
+test("group session update can opt into manager control-turn through adapter hook", async () => {
+  const adapter = {
+    ...baseAdapter(),
+    async loadGroupSession() {
+      return { ok: true };
+    },
+    async resolveGroupSessionObligation(runtimeState, groupId, payload, signals) {
+      assert.equal(runtimeState.agentId, "agent-self");
+      assert.equal(groupId, "group-1");
+      assert.equal(payload.group_session.current_stage, "step2");
+      assert.equal(signals.group_scope, true);
+      return { obligation: "required", reason: "server_manager_control_turn" };
+    },
+  };
+
+  const result = await runtime.handleRuntimeEvent(adapter, state, {
+    event: {
+      event_type: "group_session.updated",
+      payload: {
+        group_session: {
+          group_id: "group-1",
+          current_stage: "step2",
+          current_mode: "bootstrap_plus_content_output",
+        },
+      },
+    },
+    entity: {
+      group_session: {
+        group_id: "group-1",
+        current_stage: "step2",
+      },
+    },
+    group_id: "group-1",
+  });
+
+  assert.equal(result.category, "group_session");
+  assert.equal(result.obligation.obligation, "required");
+  assert.equal(result.obligation.reason, "server_manager_control_turn");
+  assert.equal(result.recommendation.mode, "needs_agent_judgment");
+  assert.equal(result.context_group_id, "group-1");
+});
+
 test("self message is observed only", async () => {
   const result = await runtime.handleRuntimeEvent(baseAdapter(), state, eventFor({
     id: "msg-4",

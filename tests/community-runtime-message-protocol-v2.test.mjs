@@ -170,13 +170,21 @@ test("group session update mounts session context and remains observe-only by de
   assert.equal(calls[0].payload.group_session.current_stage, "step1");
 });
 
-test("group session update falls back to canonical group context refresh when no session loader exists", async () => {
+test("group session update falls back to canonical group context refresh before control-turn resolution", async () => {
   const calls = [];
   const adapter = {
     ...baseAdapter(),
     async loadGroupContext(runtimeState, groupId, payload) {
       calls.push({ runtimeState, groupId, payload });
+      runtimeState.__refreshedStage = "step2";
       return { ok: true };
+    },
+    async resolveGroupSessionObligation(runtimeState, groupId, payload, signals) {
+      assert.equal(groupId, "group-1");
+      assert.equal(payload.group_session.current_stage, "step2");
+      assert.equal(runtimeState.__refreshedStage, "step2");
+      assert.equal(signals.group_scope, true);
+      return { obligation: "required", reason: "server_manager_control_turn" };
     },
   };
 
@@ -206,8 +214,9 @@ test("group session update falls back to canonical group context refresh when no
   });
 
   assert.equal(result.category, "group_session");
-  assert.equal(result.obligation.obligation, "observe_only");
-  assert.equal(result.recommendation.mode, "observe_only");
+  assert.equal(result.obligation.obligation, "required");
+  assert.equal(result.obligation.reason, "server_manager_control_turn");
+  assert.equal(result.recommendation.mode, "needs_agent_judgment");
   assert.equal(calls.length, 1);
   assert.equal(calls[0].groupId, "group-1");
   assert.equal(calls[0].runtimeState.agentId, "agent-self");

@@ -170,6 +170,50 @@ test("group session update mounts session context and remains observe-only by de
   assert.equal(calls[0].payload.group_session.current_stage, "step1");
 });
 
+test("group session update falls back to canonical group context refresh when no session loader exists", async () => {
+  const calls = [];
+  const adapter = {
+    ...baseAdapter(),
+    async loadGroupContext(runtimeState, groupId, payload) {
+      calls.push({ runtimeState, groupId, payload });
+      return { ok: true };
+    },
+  };
+
+  const result = await runtime.handleRuntimeEvent(adapter, state, {
+    event: {
+      event_type: "group_session.updated",
+      payload: {
+        group_session: {
+          group_id: "group-1",
+          current_stage: "step2",
+          current_mode: "bootstrap_plus_content_output",
+        },
+        group_context: {
+          group_id: "group-1",
+          group_context_version: "ctx:v1",
+          group_context: { scope: "partial-sync-view" },
+        },
+      },
+    },
+    entity: {
+      group_session: {
+        group_id: "group-1",
+        current_stage: "step2",
+      },
+    },
+    group_id: "group-1",
+  });
+
+  assert.equal(result.category, "group_session");
+  assert.equal(result.obligation.obligation, "observe_only");
+  assert.equal(result.recommendation.mode, "observe_only");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].groupId, "group-1");
+  assert.equal(calls[0].runtimeState.agentId, "agent-self");
+  assert.equal(calls[0].payload, null);
+});
+
 test("group session update can opt into manager control-turn through adapter hook", async () => {
   const adapter = {
     ...baseAdapter(),

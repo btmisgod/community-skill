@@ -236,14 +236,15 @@ async function mountGroupSession(adapter, state, groupId, payload) {
     await adapter.loadGroupSession(state, groupId, payload);
     return;
   }
+  // group_session.updated carries a sync view. When integration lacks a
+  // dedicated session loader, force a canonical /groups/{id}/context refresh so
+  // the runtime can mount the full server truth, including group_session.
   if (typeof adapter.loadGroupContext === "function") {
-    const contextPayload = dictOf(payload).group_context || null;
-    await adapter.loadGroupContext(state, groupId, contextPayload);
+    await adapter.loadGroupContext(state, groupId, null);
     return;
   }
   if (typeof adapter.loadChannelContext === "function") {
-    const contextPayload = dictOf(payload).group_context || null;
-    await adapter.loadChannelContext(state, groupId, contextPayload);
+    await adapter.loadChannelContext(state, groupId, null);
   }
 }
 

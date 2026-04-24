@@ -193,6 +193,22 @@ async function mountGroupSession(adapter, state, groupId, payload) {
   }
 }
 
+async function resolveGroupSessionObligation(adapter, state, groupId, payload, signals) {
+  if (!groupId || typeof adapter.resolveGroupSessionObligation !== "function") {
+    return null;
+  }
+  const decision = await adapter.resolveGroupSessionObligation(state, groupId, payload, signals);
+  const normalized = dictOf(decision);
+  const obligation = textOf(normalized.obligation).toLowerCase();
+  if (!["required", "required_ack", "optional", "observe_only"].includes(obligation)) {
+    return null;
+  }
+  return {
+    obligation,
+    reason: firstText(normalized.reason, "adapter_group_session_control"),
+  };
+}
+
 export async function handleRuntimeEvent(adapter, state, event) {
   const eventType = extractEventType(event);
   const payload = extractPayload(event);
@@ -200,13 +216,13 @@ export async function handleRuntimeEvent(adapter, state, event) {
   const classification = classifyInput(eventType, message);
   const effectiveGroupId = contextGroupId(message, payload);
   const signals = responsibilitySignals(message, state, effectiveGroupId);
-  const obligationDecision = decideObligation(classification.category, signals);
-  const recommendation = recommendHandling(classification.category, obligationDecision.obligation, signals);
 
   if (classification.category === "protocol_violation") {
     if (typeof adapter.handleProtocolViolation === "function") {
       await adapter.handleProtocolViolation(state, payload);
     }
+    const obligationDecision = decideObligation(classification.category, signals);
+    const recommendation = recommendHandling(classification.category, obligationDecision.obligation, signals);
     return judgmentResult(classification.category, message, signals, obligationDecision, recommendation);
   }
 
@@ -214,6 +230,8 @@ export async function handleRuntimeEvent(adapter, state, event) {
     if (typeof adapter.loadWorkflowContract === "function" && effectiveGroupId) {
       await adapter.loadWorkflowContract(effectiveGroupId, payload, "event");
     }
+    const obligationDecision = decideObligation(classification.category, signals);
+    const recommendation = recommendHandling(classification.category, obligationDecision.obligation, signals);
     return judgmentResult(classification.category, message, signals, obligationDecision, recommendation);
   }
 
@@ -223,16 +241,24 @@ export async function handleRuntimeEvent(adapter, state, event) {
     } else if (typeof adapter.loadChannelContext === "function" && effectiveGroupId) {
       await adapter.loadChannelContext(state, effectiveGroupId, payload);
     }
+    const obligationDecision = decideObligation(classification.category, signals);
+    const recommendation = recommendHandling(classification.category, obligationDecision.obligation, signals);
     return judgmentResult(classification.category, message, signals, obligationDecision, recommendation);
   }
 
   if (classification.category === "group_session") {
     await mountGroupSession(adapter, state, effectiveGroupId, payload);
+    const obligationDecision =
+      (await resolveGroupSessionObligation(adapter, state, effectiveGroupId, payload, signals)) ||
+      decideObligation(classification.category, signals);
+    const recommendation = recommendHandling(classification.category, obligationDecision.obligation, signals);
     return judgmentResult(classification.category, message, signals, obligationDecision, recommendation, {
       context_group_id: effectiveGroupId || null,
     });
   }
 
+  const obligationDecision = decideObligation(classification.category, signals);
+  const recommendation = recommendHandling(classification.category, obligationDecision.obligation, signals);
   return judgmentResult(classification.category, message, signals, obligationDecision, recommendation, {
     context_group_id: effectiveGroupId || null,
   });

@@ -174,6 +174,60 @@ function judgmentResult(category, message, signals, obligationDecision, recommen
   };
 }
 
+function runtimeMemo(state) {
+  if (!state || typeof state !== "object") {
+    return {};
+  }
+  if (!state.__communityRuntimeMemo || typeof state.__communityRuntimeMemo !== "object") {
+    state.__communityRuntimeMemo = {};
+  }
+  return state.__communityRuntimeMemo;
+}
+
+function managerControlTurnOf(payload) {
+  const source = dictOf(payload);
+  return (
+    dictOf(dictOf(source.group_session).manager_control_turn) ||
+    dictOf(dictOf(source.group_session_declaration).manager_control_turn) ||
+    dictOf(source.manager_control_turn)
+  );
+}
+
+function resolveBuiltInGroupSessionObligation(state, groupId, payload, signals) {
+  if (!groupId || !signals.group_scope) {
+    return null;
+  }
+  const controlTurn = managerControlTurnOf(payload);
+  if (!Object.keys(controlTurn).length) {
+    return null;
+  }
+  const selfId = textOf(state?.agentId);
+  const requiredAgentIds = listOf(controlTurn.required_agent_ids).map((item) => textOf(item)).filter(Boolean);
+  if (!selfId || !requiredAgentIds.includes(selfId)) {
+    return null;
+  }
+  const turnId = firstText(
+    controlTurn.turn_id,
+    controlTurn.activation_version,
+    dictOf(payload).group_session?.group_session_version,
+    dictOf(payload).group_session_declaration?.group_session_version,
+  );
+  if (turnId) {
+    const memo = runtimeMemo(state);
+    const seenTurns = dictOf(memo.manager_control_turns);
+    const memoKey = `${groupId}:${turnId}`;
+    if (seenTurns[memoKey]) {
+      return { obligation: "observe_only", reason: "duplicate_server_manager_control_turn" };
+    }
+    seenTurns[memoKey] = true;
+    memo.manager_control_turns = seenTurns;
+  }
+  return {
+    obligation: "required",
+    reason: firstText(controlTurn.reason, "server_manager_control_turn"),
+  };
+}
+
 async function mountGroupSession(adapter, state, groupId, payload) {
   if (!groupId) {
     return;
@@ -250,10 +304,12 @@ export async function handleRuntimeEvent(adapter, state, event) {
     await mountGroupSession(adapter, state, effectiveGroupId, payload);
     const obligationDecision =
       (await resolveGroupSessionObligation(adapter, state, effectiveGroupId, payload, signals)) ||
+      resolveBuiltInGroupSessionObligation(state, effectiveGroupId, payload, signals) ||
       decideObligation(classification.category, signals);
     const recommendation = recommendHandling(classification.category, obligationDecision.obligation, signals);
     return judgmentResult(classification.category, message, signals, obligationDecision, recommendation, {
       context_group_id: effectiveGroupId || null,
+      manager_control_turn: managerControlTurnOf(payload),
     });
   }
 

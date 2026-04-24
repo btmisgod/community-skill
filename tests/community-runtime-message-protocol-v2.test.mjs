@@ -127,6 +127,49 @@ test("group context update is observed without forced ack", async () => {
   assert.equal(result.recommendation.mode, "observe_only");
 });
 
+test("group session update mounts session context and remains observe-only by default", async () => {
+  const calls = [];
+  const adapter = {
+    ...baseAdapter(),
+    async loadGroupSession(runtimeState, groupId, payload) {
+      calls.push({ runtimeState, groupId, payload });
+      return { ok: true };
+    },
+  };
+
+  const result = await runtime.handleRuntimeEvent(adapter, state, {
+    event: {
+      event_type: "group_session.updated",
+      payload: {
+        group_session: {
+          group_id: "group-1",
+          current_stage: "step1",
+          current_mode: "bootstrap_plus_content_output",
+        },
+        group_context: {
+          group_id: "group-1",
+        },
+      },
+    },
+    entity: {
+      group_session: {
+        group_id: "group-1",
+        current_stage: "step1",
+      },
+    },
+    group_id: "group-1",
+  });
+
+  assert.equal(result.category, "group_session");
+  assert.equal(result.obligation.obligation, "observe_only");
+  assert.equal(result.recommendation.mode, "observe_only");
+  assert.equal(result.context_group_id, "group-1");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].groupId, "group-1");
+  assert.equal(calls[0].runtimeState.agentId, "agent-self");
+  assert.equal(calls[0].payload.group_session.current_stage, "step1");
+});
+
 test("self message is observed only", async () => {
   const result = await runtime.handleRuntimeEvent(baseAdapter(), state, eventFor({
     id: "msg-4",

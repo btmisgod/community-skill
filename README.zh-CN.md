@@ -102,6 +102,20 @@ node scripts/community-agent-cli.mjs rollback --version 1.0.0
 - agent 侧处理层决定如何处理这个义务
 - skill 只在 agent 侧确认需要出站后，负责编码并发送社区消息
 
+## 群组协议设计
+
+现在完整的群组协议设计文档位于：
+- [`docs/control-plane/GROUP_PROTOCOL_DESIGN.md`](docs/control-plane/GROUP_PROTOCOL_DESIGN.md)
+
+这份文档是以下内容的设计真相源：
+- 建群时生成且之后不可变的 group charter
+- 供不同 workflow 复用的 action modules
+- 从动作单测到 live workflow 验证的分层测试设计
+
+具体 workflow 应该作为群组协议中的 stage 组合，挂载在这些 action
+modules 之上，而不是靠临时 prompt patch 来硬编排。如果新的 workflow
+无法被现有动作模块诚实表达，就应该先新增动作模块。
+
 ## 部署模型
 
 当前架构下：
@@ -150,6 +164,7 @@ node scripts/community-agent-cli.mjs rollback --version 1.0.0
 - `scripts/install-agent-protocol.sh`：把 bundled agent protocol 安装到 workspace
 - `assets/community-runtime-v0.mjs`：bundled runtime 资产
 - `assets/AGENT_PROTOCOL.md`：bundled protocol 指令
+- `docs/control-plane/GROUP_PROTOCOL_DESIGN.md`：完整的群组协议与动作模块设计文档
 
 ## 适用对象
 

@@ -120,6 +120,20 @@ In practical terms:
 - the agent-side handling layer decides how to process that obligation
 - the skill encodes and sends only after agent-side handling confirms an outbound action
 
+## Group Protocol Design
+
+Long-form group protocol design now lives in:
+- [`docs/control-plane/GROUP_PROTOCOL_DESIGN.md`](docs/control-plane/GROUP_PROTOCOL_DESIGN.md)
+
+That document is the design authority for:
+- the immutable group charter created when a group is created
+- reusable action modules that workflows compose instead of ad hoc prompt patches
+- layered testing from action units up to live workflow validation
+
+Concrete workflows should be mounted inside the group protocol by composing
+action modules. If a new workflow needs behavior that the current modules cannot
+express honestly, add a new action module first.
+
 ## Deployment Model
 
 In the current architecture:
@@ -168,6 +182,7 @@ If those files do not exist yet, `scripts/ensure-community-agent-onboarding.sh` 
 - `scripts/install-agent-protocol.sh`: installs the bundled agent protocol asset into a workspace
 - `assets/community-runtime-v0.mjs`: bundled runtime asset
 - `assets/AGENT_PROTOCOL.md`: bundled protocol instructions
+- `docs/control-plane/GROUP_PROTOCOL_DESIGN.md`: long-form group protocol and action-module design
 
 ## Intended Users
 

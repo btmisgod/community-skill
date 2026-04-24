@@ -4,6 +4,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { buildActionModuleRegistryCard, getActionModule, resolveActionModuleReference } from "./action_modules/index.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,6 +17,13 @@ function slugifyHandle(value) {
     .replace(/[^a-z0-9_-]+/g, "-")
     .replace(/^-+|-+$/g, "");
   return base || `agent-${Date.now().toString().slice(-6)}`;
+}
+
+function normalizedSectionToken(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
 }
 
 function shortSocketPath(ingressHome, agentSlug) {
@@ -111,6 +119,50 @@ function saveGroupSessionStore(store) {
   return store || {};
 }
 
+function compactObservedFormalStatus(entry) {
+  const source = dictValue(entry);
+  const stepId = firstNonEmpty(source.step_id, source.stage_id);
+  const lifecyclePhase = firstNonEmpty(source.lifecycle_phase);
+  const stepStatus = firstFormalStepStatus(source);
+  const authorAgentId = firstNonEmpty(source.author_agent_id, source.declared_author_agent_id);
+  if (!stepId || !lifecyclePhase || !stepStatus || !authorAgentId) {
+    return {};
+  }
+  return pruneNullish({
+    step_id: stepId,
+    lifecycle_phase: lifecyclePhase,
+    step_status: stepStatus,
+    author_role: firstNonEmpty(source.author_role, source.declared_author_role) || null,
+    author_agent_id: authorAgentId,
+    message_id: firstNonEmpty(source.message_id) || null,
+    related_message_id: firstNonEmpty(source.related_message_id) || null,
+  }) || {};
+}
+
+function compactObservedFormalStatuses(entries, agentId = "") {
+  const normalizedAgentId = String(agentId || "").trim();
+  return listValue(entries)
+    .map((entry) => compactObservedFormalStatus(entry))
+    .filter((entry) => Object.keys(entry).length)
+    .filter((entry) => !normalizedAgentId || firstNonEmpty(entry.author_agent_id) === normalizedAgentId);
+}
+
+function hasObservedFormalStatus(entries, expected = {}, agentId = "") {
+  const normalizedExpected = dictValue(expected);
+  const expectedStepId = firstNonEmpty(normalizedExpected.step_id, normalizedExpected.stage_id);
+  const expectedLifecyclePhase = firstNonEmpty(normalizedExpected.lifecycle_phase);
+  const expectedStepStatus = firstFormalStepStatus(normalizedExpected);
+  const expectedAuthorAgentId = firstNonEmpty(normalizedExpected.author_agent_id, agentId);
+  if (!expectedStepId || !expectedLifecyclePhase || !expectedStepStatus || !expectedAuthorAgentId) {
+    return false;
+  }
+  return compactObservedFormalStatuses(entries, expectedAuthorAgentId).some((entry) => (
+    firstNonEmpty(entry.step_id) === expectedStepId &&
+    firstNonEmpty(entry.lifecycle_phase) === expectedLifecyclePhase &&
+    firstNonEmpty(entry.step_status) === expectedStepStatus
+  ));
+}
+
 export async function loadGroupSession(state, groupId, payload = null) {
   const normalizedGroupId = String(groupId || "").trim();
   if (!normalizedGroupId) {
@@ -137,19 +189,85 @@ export async function resolveGroupSessionObligation(state, groupId, payload, sig
   }
 
   const groupSession = payload?.group_session && typeof payload.group_session === "object" ? payload.group_session : {};
+  const gateSnapshot = groupSession.gate_snapshot && typeof groupSession.gate_snapshot === "object" ? groupSession.gate_snapshot : {};
+  const nextRequiredFormalSignal =
+    groupSession.next_required_formal_signal && typeof groupSession.next_required_formal_signal === "object"
+      ? groupSession.next_required_formal_signal
+      : gateSnapshot.next_required_formal_signal && typeof gateSnapshot.next_required_formal_signal === "object"
+        ? gateSnapshot.next_required_formal_signal
+        : {};
+  const pendingGateId = String(nextRequiredFormalSignal.gate_id || "").trim();
+  const pendingGate =
+    pendingGateId && gateSnapshot.gates && typeof gateSnapshot.gates === "object"
+      ? gateSnapshot.gates[pendingGateId] && typeof gateSnapshot.gates[pendingGateId] === "object"
+        ? gateSnapshot.gates[pendingGateId]
+        : {}
+      : {};
+  const pendingProducerRole = String(
+    firstNonEmpty(nextRequiredFormalSignal.producer_role, nextRequiredFormalSignal.author_role),
+  )
+    .trim()
+    .toLowerCase();
+  const selfId = String(state?.agentId || "").trim();
+  const requiredAgentIds = listValue(
+    listValue(nextRequiredFormalSignal.required_agent_ids).length
+      ? nextRequiredFormalSignal.required_agent_ids
+      : pendingGate.required_agent_ids,
+  )
+    .map((item) => String(item || "").trim())
+    .filter(Boolean);
+  const alreadyObservedByCurrentAgent = hasObservedFormalStatus(
+    dictValue(groupSession.state_json).observed_statuses,
+    {
+      step_id: firstNonEmpty(nextRequiredFormalSignal.step_id, nextRequiredFormalSignal.stage_id),
+      lifecycle_phase: firstNonEmpty(nextRequiredFormalSignal.lifecycle_phase),
+      step_status: firstNonEmpty(nextRequiredFormalSignal.step_status),
+      author_agent_id: selfId,
+    },
+    selfId,
+  );
+  if (alreadyObservedByCurrentAgent) {
+    return null;
+  }
+  const managerRequiredByAuthoritativeSession = Boolean(
+    pendingProducerRole === "manager" &&
+      selfId &&
+      requiredAgentIds.includes(selfId) &&
+      firstNonEmpty(
+        nextRequiredFormalSignal.step_id,
+        nextRequiredFormalSignal.stage_id,
+        nextRequiredFormalSignal.step_status,
+        nextRequiredFormalSignal.lifecycle_phase,
+      ),
+  );
+  const currentAgentRequiredByAuthoritativeSession = Boolean(
+    selfId &&
+      requiredAgentIds.includes(selfId) &&
+      firstNonEmpty(
+        nextRequiredFormalSignal.step_id,
+        nextRequiredFormalSignal.stage_id,
+        nextRequiredFormalSignal.step_status,
+        nextRequiredFormalSignal.lifecycle_phase,
+      ),
+  );
   const controlTurnOptIn = Boolean(
     groupSession.server_to_manager ||
       groupSession.control_turn ||
       groupSession.manager_control_turn ||
       groupSession.opt_in,
   );
-  if (!controlTurnOptIn) {
+  if (!controlTurnOptIn && !currentAgentRequiredByAuthoritativeSession) {
     return null;
   }
 
   return {
     obligation: "required",
-    reason: "server_to_manager_control_turn_opt_in",
+    reason:
+      controlTurnOptIn
+        ? "server_to_manager_control_turn_opt_in"
+        : managerRequiredByAuthoritativeSession
+          ? "server_manager_control_turn"
+          : "server_required_formal_signal",
     group_id: normalizedGroupId,
     agent_id: state?.agentId || null,
     signals: signals || null,
@@ -416,6 +534,11 @@ function deleteFileIfExists(filePath) {
 
 function signalWithTimeout(ms = 30000) {
   return AbortSignal.timeout(ms);
+}
+
+function parsePositiveInteger(value, fallback) {
+  const parsed = Number.parseInt(String(value || "").trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 async function request(pathname, options = {}) {
@@ -934,6 +1057,7 @@ export function loadWorkflowContract(groupId, contract, source = "event") {
   }
   return storeByGroup(WORKFLOW_CONTRACT_PATH, effectiveGroupId, {
     source,
+    contract,
     card: buildStoredWorkflowContractCard(contract, source),
   });
 }
@@ -1000,6 +1124,22 @@ function refreshModelEnvFromFiles() {
   }
 }
 
+function resolveConfiguredSecret(rawValue) {
+  const value = String(rawValue || "").trim();
+  if (!value) {
+    return "";
+  }
+  const braceMatch = value.match(/^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/);
+  if (braceMatch) {
+    return String(process.env[braceMatch[1]] || "").trim();
+  }
+  const envMatch = value.match(/^env:([A-Za-z_][A-Za-z0-9_]*)$/i);
+  if (envMatch) {
+    return String(process.env[envMatch[1]] || "").trim();
+  }
+  return value;
+}
+
 function resolveModelSetting(primaryKey, aliases = []) {
   const keys = [primaryKey, ...aliases];
   for (const key of keys) {
@@ -1044,8 +1184,56 @@ function renderCard(title, card) {
   return `${title}:\n${JSON.stringify(value, null, 2)}`;
 }
 
+function resolvedActionModuleCard(message, runtimeContext) {
+  const source = dictValue(message);
+  const content = dictValue(source.content);
+  const payload = dictValue(content.payload);
+  const pendingFormalSignal = dictValue(runtimeContext?.pending_formal_signal_card);
+  const combinedStatusBlock = {
+    ...pendingFormalSignal,
+    ...dictValue(source.status_block),
+    ...dictValue(payload.status_block || payload.statusBlock),
+  };
+  const resolution = resolveActionModuleReference({
+    message_type: firstNonEmpty(
+      source.message_type,
+      firstNonEmpty(pendingFormalSignal.lifecycle_phase) === "result" ? "decision" : "",
+    ),
+    flow_type: firstNonEmpty(source.flow_type, pendingFormalSignal.lifecycle_phase),
+    text: firstNonEmpty(content.text),
+    payload: {
+      ...payload,
+      ...(Object.keys(combinedStatusBlock).length ? { status_block: combinedStatusBlock } : {}),
+    },
+    status_block: combinedStatusBlock,
+    extensions: source.extensions,
+  });
+  return resolution?.contract || {};
+}
+
+function actionModuleInstructions(message, runtimeContext) {
+  return [
+    "Reusable action modules are the stable workflow primitive for execution. Use a registered module when your reply clearly matches one.",
+    renderCard("Action-module registry card", buildActionModuleRegistryCard()),
+    renderCard("Resolved current action-module card", resolvedActionModuleCard(message, runtimeContext)),
+    "If one registered action module clearly matches your reply, set action_id to that module id.",
+    "Consumer follow-up rule: if Resolved current action-module card declares consumer_follow_up_action_id and this turn is yours as the consumer, you must emit that follow-up action_id instead of mirroring the incoming action_id.",
+    "Consumer follow-up rule: when you are the consumer of the current action, do not copy or quote the producer body as your reply. Write the consumer-side body that completes the next handoff.",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 function roleAssignmentsOf(groupLayer) {
   return dictValue(dictValue(groupLayer?.members).role_assignments);
+}
+
+function normalizedRoleToken(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
 }
 
 function formalWorkflowOf(groupLayer) {
@@ -1102,6 +1290,37 @@ function roleCardForAgent(groupLayer, executionSpec, state, currentAgentRole, wo
   };
 }
 
+function assignmentResolutionCard(groupLayer, state, workerAgentIds) {
+  const members = dictValue(groupLayer?.members);
+  const roleAssignments = dictValue(members.role_assignments);
+  const aliasLabels = ["worker_a", "worker_b", "worker_c", "worker_d", "worker_e"];
+  const workerAliasToAgentId = {};
+  const namedRoleAgentIds = {};
+
+  for (const [role, config] of Object.entries(roleAssignments)) {
+    const agentId = firstNonEmpty(dictValue(config).agent_id);
+    if (agentId) {
+      namedRoleAgentIds[role] = agentId;
+    }
+  }
+
+  listValue(workerAgentIds).forEach((agentId, index) => {
+    const alias = aliasLabels[index];
+    if (alias && agentId) {
+      workerAliasToAgentId[alias] = agentId;
+    }
+  });
+
+  return {
+    manager_agent_id: firstNonEmpty(members.manager_agent_id),
+    worker_agent_ids: safeListSummary(workerAgentIds, 10),
+    worker_alias_to_agent_id: workerAliasToAgentId,
+    current_agent_worker_alias:
+      Object.entries(workerAliasToAgentId).find(([, agentId]) => agentId === state.agentId)?.[0] || null,
+    named_role_agent_ids: namedRoleAgentIds,
+  };
+}
+
 function stageCardsFor(groupLayer, executionSpec, currentStage) {
   const workflowStages = dictValue(formalWorkflowOf(groupLayer).stages);
   const workflowStage = dictValue(workflowStages[currentStage]);
@@ -1111,10 +1330,15 @@ function stageCardsFor(groupLayer, executionSpec, currentStage) {
   const nextExecutionStage = dictValue(executionStages[nextStageId]);
   return {
     workflow_stage_card: {
+      stage_id: currentStage || null,
       owner: workflowStage.owner || null,
+      organizer_role: workflowStage.organizer_role || null,
+      primary_consumer_role: workflowStage.primary_consumer_role || null,
+      observe_only_roles: safeListSummary(workflowStage.observe_only_roles, 8),
       goal: workflowStage.goal || null,
       input: safeListSummary(workflowStage.input, 12),
       output: safeListSummary(workflowStage.output, 12),
+      allowed_action_modules: safeListSummary(workflowStage.allowed_action_modules, 16),
       notes: safeListSummary(workflowStage.notes, 8),
     },
     execution_stage_card: {
@@ -1153,6 +1377,7 @@ function stageCardsFor(groupLayer, executionSpec, currentStage) {
 function runtimeSessionCard(session) {
   const gateSnapshot = dictValue(session?.gate_snapshot);
   const stateJson = dictValue(session?.state_json);
+  const lastStatusBlock = dictValue(stateJson.last_status_block);
   return {
     workflow_id: session?.workflow_id || null,
     current_mode: session?.current_mode || null,
@@ -1164,6 +1389,16 @@ function runtimeSessionCard(session) {
     observed_status_count: listValue(stateJson.observed_statuses).length,
     latest_forced_proceed_stage_ids: safeListSummary(stateJson.latest_forced_proceed_stage_ids, 8),
     latest_final_artifact_message_id: stateJson.latest_final_artifact_message_id || null,
+    last_status_block: Object.keys(lastStatusBlock).length
+      ? pruneNullish({
+          step_id: firstNonEmpty(lastStatusBlock.step_id, lastStatusBlock.stage_id) || null,
+          lifecycle_phase: firstNonEmpty(lastStatusBlock.lifecycle_phase) || null,
+          author_role: firstNonEmpty(lastStatusBlock.author_role) || null,
+          author_agent_id: firstNonEmpty(lastStatusBlock.author_agent_id) || null,
+          step_status: firstFormalStepStatus(lastStatusBlock) || null,
+          related_message_id: firstNonEmpty(lastStatusBlock.related_message_id) || null,
+        }) || undefined
+      : undefined,
     gate: {
       current_stage: gateSnapshot.current_stage || null,
       next_stage: gateSnapshot.next_stage || null,
@@ -1173,6 +1408,203 @@ function runtimeSessionCard(session) {
       advanced_from: gateSnapshot.advanced_from || null,
       advanced_to: gateSnapshot.advanced_to || null,
     },
+  };
+}
+
+function resolveProtocolGroupLayer(protocolData = {}) {
+  const source = dictValue(protocolData);
+  const data = dictValue(source.data);
+  const dataGroupMetadata = dictValue(dictValue(data.group).metadata_json);
+  const sourceGroupMetadata = dictValue(dictValue(source.group).metadata_json);
+  const dataCommunityProtocols = dictValue(dataGroupMetadata.community_protocols);
+  const sourceCommunityProtocols = dictValue(sourceGroupMetadata.community_protocols);
+  const dataCommunityV2 = dictValue(dataGroupMetadata.community_v2);
+  const sourceCommunityV2 = dictValue(sourceGroupMetadata.community_v2);
+  const candidates = [
+    dictValue(dataCommunityProtocols.channel),
+    dictValue(sourceCommunityProtocols.channel),
+    dictValue(dataCommunityV2.group_protocol),
+    dictValue(sourceCommunityV2.group_protocol),
+    dictValue(source.group_protocol),
+  ];
+  return candidates.find((candidate) => Object.keys(candidate).length) || {};
+}
+
+function pendingFormalSignalAlreadyObservedByCurrentAgent(state, runtimeContext) {
+  const pendingFormalSignal = dictValue(runtimeContext?.pending_formal_signal_card);
+  const observedStatuses = listValue(runtimeContext?.__current_agent_observed_statuses);
+  if (!Object.keys(pendingFormalSignal).length || !observedStatuses.length) {
+    return false;
+  }
+  const expectedKinds = expectedBusinessArtifactKinds(runtimeContext);
+  if (expectedKinds.length) {
+    return false;
+  }
+  return hasObservedFormalStatus(observedStatuses, {
+    step_id: firstNonEmpty(
+      pendingFormalSignal.step_id,
+      pendingFormalSignal.stage_id,
+      dictValue(runtimeContext?.execution_stage_card).stage_id,
+      dictValue(runtimeContext?.runtime_session_card).current_stage,
+    ),
+    lifecycle_phase: firstNonEmpty(pendingFormalSignal.lifecycle_phase),
+    step_status: firstNonEmpty(pendingFormalSignal.step_status),
+    author_agent_id: firstNonEmpty(state?.agentId),
+  }, firstNonEmpty(state?.agentId));
+}
+
+function currentRoleCandidates(runtimeContext) {
+  const roleCard = dictValue(runtimeContext?.role_card);
+  return uniqueNonEmpty([
+    normalizedRoleToken(firstNonEmpty(roleCard.current_agent_role)),
+    normalizedRoleToken(firstNonEmpty(roleCard.server_gate_role)),
+  ]);
+}
+
+function ownerTokenMatchesCurrentRole(ownerToken, runtimeContext) {
+  const owner = normalizedRoleToken(ownerToken);
+  const roleCandidates = currentRoleCandidates(runtimeContext);
+  if (!owner || !roleCandidates.length) {
+    return false;
+  }
+  if (roleCandidates.includes(owner)) {
+    return true;
+  }
+  for (const role of roleCandidates) {
+    if (!role) {
+      continue;
+    }
+    if (
+      owner.startsWith(`${role}_`) ||
+      owner.startsWith(`${role}_and_`) ||
+      owner.includes(`_and_${role}_`) ||
+      owner.endsWith(`_and_${role}`)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function pendingFormalSignalOwnsCurrentAgent(state, runtimeContext) {
+  const pending = dictValue(runtimeContext?.pending_formal_signal_card);
+  const currentRoles = currentRoleCandidates(runtimeContext);
+  const requiredAgentIds = listValue(pending.required_agent_ids).filter(Boolean);
+  if (state?.agentId && requiredAgentIds.includes(state.agentId)) {
+    return true;
+  }
+  const producerRole = normalizedRoleToken(firstNonEmpty(pending.producer_role, pending.author_role));
+  if (producerRole && currentRoles.includes(producerRole)) {
+    return true;
+  }
+  return false;
+}
+
+export function protocolTurnOwnershipDecision(state, message = {}, runtimeContext = {}, judgment = {}) {
+  const obligationReason = firstNonEmpty(judgment?.obligation?.reason);
+  const recommendationMode = firstNonEmpty(judgment?.recommendation?.mode);
+  if (obligationReason !== "visible_collaboration" || recommendationMode !== "agent_discretion") {
+    return {
+      owned: true,
+      reason: "not_optional_visible_collaboration",
+    };
+  }
+
+  const selfId = firstNonEmpty(state?.agentId);
+  const targetAgentId = firstNonEmpty(message?.target_agent_id);
+  const mentionIds = listValue(message?.mentions)
+    .map((item) => dictValue(item))
+    .map((item) => firstNonEmpty(item.mention_id, item.agent_id))
+    .filter(Boolean);
+  if (selfId && targetAgentId && targetAgentId === selfId) {
+    return {
+      owned: true,
+      reason: "targeted_to_self",
+    };
+  }
+  if (selfId && mentionIds.includes(selfId)) {
+    return {
+      owned: true,
+      reason: "mentioned_to_self",
+    };
+  }
+  if (pendingFormalSignalOwnsCurrentAgent(state, runtimeContext)) {
+    return {
+      owned: true,
+      reason: "pending_formal_signal",
+    };
+  }
+
+  const stageOwner = firstNonEmpty(
+    dictValue(runtimeContext?.workflow_stage_card).owner,
+    dictValue(runtimeContext?.group_objective_card).stage_owner,
+  );
+  if (ownerTokenMatchesCurrentRole(stageOwner, runtimeContext)) {
+    return {
+      owned: true,
+      reason: "stage_owner",
+    };
+  }
+
+  return {
+    owned: false,
+    reason: "protocol_turn_not_owned",
+    stage_owner: stageOwner || null,
+    current_roles: currentRoleCandidates(runtimeContext),
+  };
+}
+
+function pendingFormalSignalCard(session) {
+  const gateSnapshot = dictValue(session?.gate_snapshot);
+  const gates = dictValue(gateSnapshot.gates);
+  const nextRequiredFormalSignal = Object.keys(dictValue(session?.next_required_formal_signal)).length
+    ? dictValue(session?.next_required_formal_signal)
+    : dictValue(gateSnapshot.next_required_formal_signal);
+  if (!Object.keys(nextRequiredFormalSignal).length) {
+    return {};
+  }
+  const pendingGate = dictValue(gates[firstNonEmpty(nextRequiredFormalSignal.gate_id)]);
+  return {
+    gate_id: firstNonEmpty(nextRequiredFormalSignal.gate_id),
+    step_id: firstNonEmpty(nextRequiredFormalSignal.step_id, nextRequiredFormalSignal.stage_id),
+    step_status: firstNonEmpty(nextRequiredFormalSignal.step_status),
+    producer_role: firstNonEmpty(nextRequiredFormalSignal.producer_role, nextRequiredFormalSignal.author_role),
+    lifecycle_phase: firstNonEmpty(nextRequiredFormalSignal.lifecycle_phase),
+    reason: firstNonEmpty(nextRequiredFormalSignal.reason),
+    required_agent_ids: safeListSummary(
+      listValue(nextRequiredFormalSignal.required_agent_ids).length
+        ? nextRequiredFormalSignal.required_agent_ids
+        : pendingGate.required_agent_ids,
+      10,
+    ),
+  };
+}
+
+function bootstrapControlTurnCard(runtimeContext) {
+  const roleCard = dictValue(runtimeContext?.role_card);
+  const runtimeSession = dictValue(runtimeContext?.runtime_session_card);
+  const executionStage = dictValue(runtimeContext?.execution_stage_card);
+  const pendingFormalSignal = dictValue(runtimeContext?.pending_formal_signal_card);
+  const currentStage = firstNonEmpty(executionStage.stage_id, runtimeSession.current_stage);
+  const currentMode = firstNonEmpty(runtimeSession.current_mode);
+  const businessArtifactKinds = expectedBusinessArtifactKinds(runtimeContext);
+  if (
+    firstNonEmpty(roleCard.current_agent_role) !== "manager" ||
+    currentMode !== "bootstrap" ||
+    !["step0", "step1", "step2", "formal_start"].includes(currentStage) ||
+    firstNonEmpty(pendingFormalSignal.producer_role) !== "manager" ||
+    !firstNonEmpty(pendingFormalSignal.step_status)
+  ) {
+    return {};
+  }
+  return {
+    current_mode: currentMode,
+    current_stage: currentStage,
+    step_id: firstNonEmpty(pendingFormalSignal.step_id, currentStage),
+    step_status: firstNonEmpty(pendingFormalSignal.step_status),
+    lifecycle_phase: firstNonEmpty(pendingFormalSignal.lifecycle_phase),
+    expected_business_artifact_kinds: safeListSummary(businessArtifactKinds, 8),
+    text_first_control_message_allowed: businessArtifactKinds.length === 0,
   };
 }
 
@@ -1213,15 +1645,352 @@ function buildStoredWorkflowContractCard(payload, source = "event") {
   };
 }
 
-function loadModelConfig() {
+function resolveOpenClawHome(workspaceRoot = WORKSPACE) {
+  const candidates = [
+    process.env.OPENCLAW_HOME,
+    path.basename(workspaceRoot) === "workspace" ? path.resolve(workspaceRoot, "..") : "",
+    "/root/.openclaw",
+  ];
+  for (const candidate of candidates) {
+    const normalized = String(candidate || "").trim();
+    if (!normalized) {
+      continue;
+    }
+    if (fs.existsSync(path.join(normalized, "openclaw.json"))) {
+      return normalized;
+    }
+  }
+  return "";
+}
+
+function parseProviderModelRef(value) {
+  const text = String(value || "").trim();
+  if (!text) {
+    return { providerName: "", modelId: "" };
+  }
+  const slash = text.indexOf("/");
+  if (slash <= 0 || slash >= text.length - 1) {
+    return { providerName: "", modelId: "" };
+  }
+  return {
+    providerName: text.slice(0, slash).trim(),
+    modelId: text.slice(slash + 1).trim(),
+  };
+}
+
+function orderedModelProviders(openclawConfig, modelsConfig) {
+  const ordered = [];
+  const seen = new Set();
+  for (const source of [modelsConfig?.providers, openclawConfig?.models?.providers]) {
+    for (const [providerName, providerConfig] of Object.entries(dictValue(source))) {
+      if (seen.has(providerName)) {
+        continue;
+      }
+      seen.add(providerName);
+      ordered.push([providerName, dictValue(providerConfig)]);
+    }
+  }
+  return ordered;
+}
+
+function buildModelCandidate(baseUrl, apiKey, modelId, timeoutMs, metadata = {}) {
+  const normalizedBaseUrl = String(baseUrl || "").trim().replace(/\/$/, "");
+  const normalizedApiKey = String(apiKey || "").trim();
+  const normalizedModelId = String(modelId || "").trim();
+  if (!normalizedBaseUrl || !normalizedApiKey || !normalizedModelId) {
+    return null;
+  }
+  return {
+    baseUrl: normalizedBaseUrl,
+    apiKey: normalizedApiKey,
+    modelId: normalizedModelId,
+    timeoutMs,
+    provider: String(metadata.provider || "").trim() || undefined,
+    source: String(metadata.source || "").trim() || undefined,
+    priorityTier: Number.isFinite(Number(metadata.priorityTier)) ? Number(metadata.priorityTier) : 0,
+    priorityIndex: Number.isFinite(Number(metadata.priorityIndex)) ? Number(metadata.priorityIndex) : 0,
+  };
+}
+
+function loadSourceOfTruthModelCandidates(timeoutMs, workspaceRoot = WORKSPACE) {
+  const openclawHome = resolveOpenClawHome(workspaceRoot);
+  if (!openclawHome) {
+    return [];
+  }
+
+  const openclawPath = path.join(openclawHome, "openclaw.json");
+  const modelsPath = path.join(openclawHome, "agents", "main", "agent", "models.json");
+  const openclawConfig = loadJson(openclawPath, {}) || {};
+  const modelsConfig = loadJson(modelsPath, {}) || {};
+  const providers = orderedModelProviders(openclawConfig, modelsConfig);
+  if (!providers.length) {
+    return [];
+  }
+
+  const providerMap = new Map(providers);
+  const candidates = [];
+  let priorityIndex = 0;
+  const addCandidate = (providerName, modelId, sourceLabel) => {
+    const provider = dictValue(providerMap.get(providerName));
+    if (!Object.keys(provider).length) {
+      return;
+    }
+    const providerApi = String(provider.api || "").trim();
+    if (providerApi && providerApi !== "openai-completions") {
+      return;
+    }
+    const baseUrl = resolveConfiguredSecret(provider.baseUrl);
+    const apiKey = resolveConfiguredSecret(provider.apiKey);
+    const candidate = buildModelCandidate(baseUrl, apiKey, modelId, timeoutMs, {
+      provider: providerName,
+      source: sourceLabel,
+      priorityTier: 1,
+      priorityIndex: priorityIndex++,
+    });
+    if (candidate) {
+      candidates.push(candidate);
+    }
+  };
+
+  const primaryRef = parseProviderModelRef(openclawConfig?.agents?.defaults?.model?.primary);
+  if (primaryRef.providerName && primaryRef.modelId) {
+    addCandidate(primaryRef.providerName, primaryRef.modelId, `${openclawPath}:agents.defaults.model.primary`);
+  }
+
+  for (const [providerName, provider] of providers) {
+    const models = Array.isArray(provider.models) ? provider.models : [];
+    for (const model of models) {
+      const modelId = firstNonEmpty(model?.id, model?.name);
+      if (!modelId) {
+        continue;
+      }
+      addCandidate(providerName, modelId, `${modelsPath}:providers.${providerName}.models`);
+    }
+  }
+
+  return candidates;
+}
+
+function dedupeModelCandidates(candidates) {
+  const deduped = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const signature = `${candidate.baseUrl}::${candidate.modelId}::${candidate.apiKey}`;
+    if (seen.has(signature)) {
+      continue;
+    }
+    seen.add(signature);
+    deduped.push(candidate);
+  }
+  return deduped;
+}
+
+const MODEL_CANDIDATE_FAILURE_CACHE = new Map();
+const MODEL_CANDIDATE_SUCCESS_CACHE = new Map();
+
+function modelCandidateFailureKey(candidate) {
+  return `${candidate.baseUrl}::${candidate.modelId}::${candidate.apiKey}`;
+}
+
+function pruneModelCandidateFailureCache(now = Date.now()) {
+  for (const [key, entry] of MODEL_CANDIDATE_FAILURE_CACHE.entries()) {
+    if (!entry || Number(entry.suppressed_until || 0) <= now) {
+      MODEL_CANDIDATE_FAILURE_CACHE.delete(key);
+    }
+  }
+}
+
+function pruneModelCandidateSuccessCache() {
+  if (MODEL_CANDIDATE_SUCCESS_CACHE.size <= 8) {
+    return;
+  }
+  const ordered = [...MODEL_CANDIDATE_SUCCESS_CACHE.entries()].sort(
+    (left, right) => Number(right[1] || 0) - Number(left[1] || 0),
+  );
+  MODEL_CANDIDATE_SUCCESS_CACHE.clear();
+  for (const [key, value] of ordered.slice(0, 8)) {
+    MODEL_CANDIDATE_SUCCESS_CACHE.set(key, value);
+  }
+}
+
+function modelCandidateFailureCooldownMs(error) {
+  const text = String(error?.message || error || "").trim();
+  if (!text) {
+    return 0;
+  }
+  if (/UnsupportedModel|does not support the coding plan feature/i.test(text)) {
+    return 6 * 60 * 60 * 1000;
+  }
+  if (/AccountQuotaExceeded|Insufficient Balance/i.test(text)) {
+    return 30 * 60 * 1000;
+  }
+  if (/AccountRateLimitExceeded|TPM limit reached|TooManyRequests|rate limit/i.test(text)) {
+    return 5 * 60 * 1000;
+  }
+  if (/aborted due to timeout|timeout/i.test(text)) {
+    return 2 * 60 * 1000;
+  }
+  return 0;
+}
+
+function suppressFailedModelCandidate(candidate, error) {
+  const cooldownMs = modelCandidateFailureCooldownMs(error);
+  if (cooldownMs <= 0) {
+    return;
+  }
+  MODEL_CANDIDATE_FAILURE_CACHE.set(modelCandidateFailureKey(candidate), {
+    suppressed_until: Date.now() + cooldownMs,
+    reason: String(error?.message || error || "model request failed"),
+  });
+}
+
+function markSuccessfulModelCandidate(candidate) {
+  MODEL_CANDIDATE_SUCCESS_CACHE.set(modelCandidateFailureKey(candidate), Date.now());
+  pruneModelCandidateSuccessCache();
+}
+
+function prioritizeSuccessfulModelCandidates(candidates) {
+  return [...candidates].sort((left, right) => {
+    const leftTier = Number(left.priorityTier || 0);
+    const rightTier = Number(right.priorityTier || 0);
+    if (leftTier !== rightTier) {
+      return leftTier - rightTier;
+    }
+    const leftTs = Number(MODEL_CANDIDATE_SUCCESS_CACHE.get(modelCandidateFailureKey(left)) || 0);
+    const rightTs = Number(MODEL_CANDIDATE_SUCCESS_CACHE.get(modelCandidateFailureKey(right)) || 0);
+    if (leftTs !== rightTs) {
+      return rightTs - leftTs;
+    }
+    return Number(left.priorityIndex || 0) - Number(right.priorityIndex || 0);
+  });
+}
+
+function activeModelCandidates(candidates) {
+  pruneModelCandidateFailureCache();
+  const active = candidates.filter((candidate) => {
+    const entry = MODEL_CANDIDATE_FAILURE_CACHE.get(modelCandidateFailureKey(candidate));
+    return !entry;
+  });
+  return prioritizeSuccessfulModelCandidates(active);
+}
+
+export function resetModelCandidateFailureCache() {
+  MODEL_CANDIDATE_FAILURE_CACHE.clear();
+  MODEL_CANDIDATE_SUCCESS_CACHE.clear();
+}
+
+export function loadModelConfig() {
   refreshModelEnvFromFiles();
-  const baseUrl = resolveModelSetting("MODEL_BASE_URL", ["OPENAI_BASE_URL", "OPENAI_API_BASE", "LLM_BASE_URL"]);
-  const apiKey = resolveModelSetting("MODEL_API_KEY", ["OPENAI_API_KEY", "LLM_API_KEY"]);
-  const modelId = resolveModelSetting("MODEL_ID", ["OPENAI_MODEL", "OPENAI_MODEL_ID", "DEFAULT_MODEL", "MODEL"]);
-  if (!baseUrl || !apiKey || !modelId) {
+  const timeoutMs = parsePositiveInteger(
+    resolveModelSetting("COMMUNITY_MODEL_TIMEOUT_MS", ["MODEL_TIMEOUT_MS", "OPENAI_TIMEOUT_MS", "LLM_TIMEOUT_MS"]),
+    120000,
+  );
+  let explicitPriorityIndex = 0;
+  const buildEnvCandidate = (baseKey, apiKeyKey, modelIdKey, aliases = {}) =>
+    buildModelCandidate(
+      resolveModelSetting(baseKey, aliases.baseUrl || []),
+      resolveModelSetting(apiKeyKey, aliases.apiKey || []),
+      resolveModelSetting(modelIdKey, aliases.modelId || []),
+      timeoutMs,
+      {
+        source: `environment:${baseKey}/${apiKeyKey}/${modelIdKey}`,
+        priorityTier: 0,
+        priorityIndex: explicitPriorityIndex++,
+      },
+    );
+  const explicitCandidates = [
+    buildEnvCandidate("COMMUNITY_MODEL_PRIMARY_BASE_URL", "COMMUNITY_MODEL_PRIMARY_API_KEY", "COMMUNITY_MODEL_PRIMARY_MODEL_ID"),
+    buildEnvCandidate("MODEL_BASE_URL", "MODEL_API_KEY", "MODEL_ID", {
+      baseUrl: ["OPENAI_BASE_URL", "OPENAI_API_BASE", "LLM_BASE_URL"],
+      apiKey: ["OPENAI_API_KEY", "LLM_API_KEY"],
+      modelId: ["OPENAI_MODEL", "OPENAI_MODEL_ID", "DEFAULT_MODEL", "MODEL"],
+    }),
+    buildEnvCandidate("COMMUNITY_MODEL_FALLBACK_1_BASE_URL", "COMMUNITY_MODEL_FALLBACK_1_API_KEY", "COMMUNITY_MODEL_FALLBACK_1_MODEL_ID"),
+    buildEnvCandidate("COMMUNITY_MODEL_FALLBACK_2_BASE_URL", "COMMUNITY_MODEL_FALLBACK_2_API_KEY", "COMMUNITY_MODEL_FALLBACK_2_MODEL_ID"),
+  ].filter(Boolean);
+  const truthSourceCandidates = loadSourceOfTruthModelCandidates(timeoutMs);
+  const deduped = dedupeModelCandidates([...explicitCandidates, ...truthSourceCandidates]);
+  if (!deduped.length) {
     throw new Error("MODEL_BASE_URL, MODEL_API_KEY, and MODEL_ID must be set or inherited from current agent model config");
   }
-  return { baseUrl: baseUrl.replace(/\/$/, ""), apiKey, modelId };
+  return deduped;
+}
+
+async function requestModelCompletion(endpoint, headers, requestBody, timeoutMs) {
+  let response = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(requestBody),
+    signal: signalWithTimeout(timeoutMs),
+  });
+  let payload = await response.json();
+  const responseFormatUnsupported =
+    !response.ok &&
+    String(payload?.error?.code || "").trim() === "InvalidParameter" &&
+    String(payload?.error?.param || "").trim() === "response_format.type";
+  if (responseFormatUnsupported) {
+    const fallbackBody = { ...requestBody };
+    delete fallbackBody.response_format;
+    response = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(fallbackBody),
+      signal: signalWithTimeout(timeoutMs),
+    });
+    payload = await response.json();
+  }
+  return { response, payload };
+}
+
+async function requestModelJson(requestBody) {
+  const candidates = activeModelCandidates(loadModelConfig());
+  if (!candidates.length) {
+    throw new Error("All configured model candidates are temporarily suppressed");
+  }
+  let lastError = null;
+  for (const candidate of candidates) {
+    const endpoint = `${candidate.baseUrl}/chat/completions`;
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${candidate.apiKey}`,
+    };
+    try {
+      const { response, payload } = await requestModelCompletion(
+        endpoint,
+        headers,
+        {
+          ...requestBody,
+          model: candidate.modelId,
+        },
+        candidate.timeoutMs,
+      );
+      if (!response.ok) {
+        throw new Error(`Model request failed: ${JSON.stringify(payload)}`);
+      }
+      MODEL_CANDIDATE_FAILURE_CACHE.delete(modelCandidateFailureKey(candidate));
+      markSuccessfulModelCandidate(candidate);
+      return payload;
+    } catch (error) {
+      lastError = error;
+      suppressFailedModelCandidate(candidate, error);
+      console.error(
+        JSON.stringify(
+          {
+            ok: false,
+            model_request_failed: true,
+            modelId: candidate.modelId,
+            baseUrl: candidate.baseUrl,
+            provider: candidate.provider || null,
+            source: candidate.source || null,
+            error: String(error?.message || error || "unknown model error"),
+          },
+          null,
+          2,
+        ),
+      );
+    }
+  }
+  throw lastError || new Error("All configured model candidates failed");
 }
 
 function runtimeInstructions(runtimeContext) {
@@ -1236,11 +2005,27 @@ function runtimeInstructions(runtimeContext) {
     renderCard("Current workflow stage card", runtimeContext.workflow_stage_card),
     renderCard("Current execution stage card", runtimeContext.execution_stage_card),
     renderCard("Runtime session card", runtimeContext.runtime_session_card),
+    renderCard("Pending formal signal card", runtimeContext.pending_formal_signal_card),
+    renderCard("Assignment resolution card", runtimeContext.assignment_resolution_card),
+    renderCard("Bootstrap control-turn card", runtimeContext.bootstrap_control_turn_card),
     renderCard("Transition rules card", runtimeContext.transition_rules_card),
+    "If Pending formal signal card names a producer_role that matches your current role, treat that card as the exact formal token to emit now unless runtime rules explicitly require correction instead.",
+    "Do not invent neighboring formal statuses. If Pending formal signal card says step_status=step1_done, do not emit step1_result_aligned, closed, or other aliases.",
     "If runtime context says the current agent role is manager and the current stage is manager-owned, do not describe what the manager should do in third person. You are that manager and must emit the formal manager signal directly.",
-    "Manager-specific rule: never close a stage mechanically. Before any manager-owned close signal, inspect the incoming message and verify that the current stage deliverable or evidence actually exists.",
-    "Manager-specific rule: if the current message does not contain the expected deliverable/evidence, do not emit a formal close signal. Ask for the missing artifact or request correction instead.",
-    "Manager-specific rule: every manager close must carry a structured payload with real content or explicit evidence_refs/artifact_refs. Plain text plus a status_block is invalid.",
+    "Stage-owner rule: if Current workflow stage card owner matches your role and this turn is the stage kickoff/control-turn or otherwise lacks an incoming business artifact, you must create the current stage artifact from the mounted runtime cards and current thread context instead of asking another agent to do your assigned work.",
+    "Stage-owner rule: do not treat the absence of a prior artifact in the incoming message as a blocker when the stage contract makes you the producer of that artifact. Produce it now in visible body text plus the required structured payload.",
+    "Manager-specific rule: if the current stage declares expected business artifact kinds, never close it mechanically. Verify that the current stage artifact or evidence actually exists first.",
+    "Manager-specific rule: if the current stage is a bootstrap control turn and Bootstrap control-turn card says text_first_control_message_allowed=true, a public text-first coordination message plus the exact top-level status_block is valid. Do not invent a business payload.",
+    "Manager-specific rule: bootstrap control turns stay coordination-only. Do not fake evidence_refs, artifact_refs, or business deliverables just to satisfy the formal signal.",
+    "Manager-specific rule: if you are not the producer of the required artifact and the business-stage message does not contain the expected deliverable/evidence, do not emit a formal close signal. Ask for the missing artifact or request correction instead.",
+    "Manager-specific rule: for business stages with expected artifact kinds, every manager close must carry a structured payload with real content or explicit evidence_refs/artifact_refs. Plain text plus a status_block is invalid there.",
+    "Role identity is exclusive. If Role card says tester, editor, worker_a, or worker_b, do not describe yourself as also being another peer role and do not claim a peer's assignment as your own.",
+    "Group-protocol rule: treat the current group charter and action-module contract as the only reusable workflow truth source. Do not import product- or workflow-specific rules that are not present in the mounted cards.",
+    "Protocol-driven reply rule: if Current workflow stage card owner/notes make another role the in-stage organizer, first consumer, or acting producer, and you are neither directly targeted nor named by Pending formal signal card, do not send a routine public acknowledgement.",
+    "Protocol-driven reply rule: if you are manager but Current workflow stage card is not manager-owned and Pending formal signal card does not name manager, do not reply to ordinary in-stage progress unless a direct escalation or explicit question targets you.",
+    "Protocol-driven reply rule: if Current workflow stage card notes say your role is observe-only for the current stage, stay silent unless you are directly targeted or the Pending formal signal card names your role.",
+    "Assignment resolution rule: use Assignment resolution card only to map explicit aliases or role labels to concrete agent ids. Do not invent additional aliases or claim an assignment that resolves to another agent id.",
+    "If the current stage card is generic or action-module based, rely on role boundary, routing, pending formal signal, and the resolved action-module card instead of importing older stage choreography.",
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -1300,12 +2085,16 @@ export function buildExecutionPrompt(message, state, runtimeContext, judgment = 
         "When producing a formal workflow signal, place the formal fields in top-level status_block instead of only nesting them inside payload.",
         "Do not emit a generic acknowledgement when substantive agent action or a formal signal is required.",
         "Do not say 'manager should...' when runtime context identifies you as the manager. In that case emit the manager-owned artifact or formal signal now.",
-        "If you are the manager, you must not advance a stage unless your response includes the stage-appropriate artifact or evidence-backed decision payload.",
-        "If you cannot verify the required deliverable/evidence from the current message, do not emit a formal close status_block. Return a correction/review style message instead.",
+        "If Pending formal signal card identifies your role and provides a step_status/lifecycle_phase, emit that exact top-level status_block instead of inventing adjacent statuses.",
+        "If you are the manager and runtime context declares expected business artifact kinds for the current stage, you must not advance that stage unless your response includes the stage-appropriate artifact or evidence-backed decision payload.",
+        "If Current workflow stage card owner matches your role and this turn is a kickoff/control-turn or the incoming message lacks the business artifact you are supposed to produce, create that artifact now from runtime cards and current thread context. Do not answer with a meta reminder about what your own role should do.",
+        "If runtime context declares a manager-owned bootstrap control turn with no expected business artifact kinds, send the required public coordination message now with the exact top-level status_block. Do not invent a business payload.",
+        "If runtime context declares a business-stage artifact requirement and you are not the producer of that artifact and cannot verify it from the current message/thread context, do not emit a formal close status_block. Return a correction/review style message instead.",
         "Do not invent message sources. The current source is Agent Community webhook delivery.",
         "Do not expose internal chain-of-thought.",
         agentProtocol,
         runtimeInstructions(runtimeContext),
+        actionModuleInstructions(message, runtimeContext),
         channelContextInstructions(message?.group_id),
         workflowContractInstructions(message?.group_id),
         judgment ? `Current runtime judgment:\n\n${JSON.stringify(judgment, null, 2)}` : "",
@@ -1324,6 +2113,7 @@ export function buildExecutionPrompt(message, state, runtimeContext, judgment = 
         "Return JSON only.",
         `message_type: ${message.message_type}`,
         `message_content: ${JSON.stringify(message.content, null, 2)}`,
+        "If message_content is empty because this is a group_session control turn, rely on the runtime cards and current runtime judgment to produce the required public control message.",
       ].join("\n\n"),
     },
   ];
@@ -1350,9 +2140,11 @@ function normalizeExecutionDecision(parsed, raw) {
   const extensions = dictValue(source.extensions);
   const intent = firstNonEmpty(source.intent, dictValue(extensions.custom).intent, inferIntentFromText(text));
   const messageType = normalizeOutboundMessageType(source.message_type || source.messageType || "analysis");
-  const flowType =
-    firstNonEmpty(source.flow_type, source.flowType) ||
-    inferFlowType(messageType, intent);
+  const flowType = normalizeOutboundFlowType(
+    firstNonEmpty(source.flow_type, source.flowType),
+    messageType,
+    intent,
+  );
   const shouldSend = Boolean(
     source.should_send ?? source.shouldReply ?? source.should_reply ?? text,
   );
@@ -1375,6 +2167,471 @@ function normalizeExecutionDecision(parsed, raw) {
     },
     reason: firstNonEmpty(source.reason, source.decision_reason),
     raw,
+  };
+}
+
+function decisionActionModuleId(decision) {
+  const source = dictValue(decision);
+  const payload = dictValue(source.payload);
+  const extensions = dictValue(source.extensions);
+  const custom = dictValue(extensions.custom);
+  return firstNonEmpty(source.action_id, payload.action_id, custom.action_id);
+}
+
+function normalizeConsumerFollowUpDecision(decision, state, message, runtimeContext) {
+  const source = dictValue(decision);
+  if (!source.should_send || !firstNonEmpty(source.text)) {
+    return decision;
+  }
+
+  const incomingActionRef = resolveActionModuleReference(message);
+  const followUpActionId = firstNonEmpty(dictValue(incomingActionRef.contract).consumer_follow_up_action_id);
+  if (!followUpActionId) {
+    return decision;
+  }
+
+  const incomingActionId = firstNonEmpty(incomingActionRef.action_id);
+  const outgoingActionId = firstNonEmpty(decisionActionModuleId(source));
+  if (outgoingActionId && outgoingActionId !== incomingActionId) {
+    return decision;
+  }
+
+  return {
+    ...source,
+    payload: {
+      ...dictValue(source.payload),
+      action_id: followUpActionId,
+    },
+    extensions: {
+      ...dictValue(source.extensions),
+      custom: {
+        ...dictValue(dictValue(source.extensions).custom),
+        action_id: followUpActionId,
+        consumer_follow_up_normalized: true,
+      },
+    },
+  };
+}
+
+function deterministicStageArtifactScaffold(runtimeContext) {
+  if (!allowsDeterministicArtifactFallback(runtimeContext)) {
+    return {};
+  }
+  const expectedKinds = expectedStageArtifactKinds(runtimeContext);
+  if (expectedKinds.length !== 1) {
+    return {};
+  }
+  const kind = firstNonEmpty(expectedKinds[0]);
+  const workflowStageCard = dictValue(runtimeContext?.workflow_stage_card);
+  const executionStageCard = dictValue(runtimeContext?.execution_stage_card);
+  const productContractCard = dictValue(runtimeContext?.product_contract_card);
+  const roleCard = dictValue(runtimeContext?.role_card);
+  const groupObjective = firstNonEmpty(dictValue(runtimeContext?.group_objective_card).group_objective);
+  const stageGoal = firstNonEmpty(workflowStageCard.goal, executionStageCard.stage_id);
+  const nextStage = firstNonEmpty(executionStageCard.next_stage);
+  const currentStage = firstNonEmpty(executionStageCard.stage_id);
+  const currentRole = firstNonEmpty(roleCard.current_agent_role, roleCard.server_gate_role, "agent");
+  const allSections = listValue(productContractCard.sections).filter(Boolean);
+  const fallbackSections = allSections.length ? allSections : ["general"];
+  const scopedSections =
+    currentRole === "worker_a" && fallbackSections.length > 1
+      ? fallbackSections.slice(0, Math.ceil(fallbackSections.length / 2))
+      : currentRole === "worker_b" && fallbackSections.length > 1
+        ? fallbackSections.slice(Math.ceil(fallbackSections.length / 2))
+        : fallbackSections;
+  const buildItem = (section, index, extra = {}) => ({
+    section,
+    title: `${section.replace(/_/g, " ")} item ${index + 1}`,
+    summary: `${stageGoal || currentStage || "current stage"} by ${currentRole}`,
+    source: `deterministic_${currentStage || "stage"}_${currentRole}`,
+    ...extra,
+  });
+  const sectionEntries = scopedSections.map((section, sectionIndex) => ({
+    section,
+    items: [buildItem(section, sectionIndex)],
+  }));
+  const flatItems = sectionEntries.flatMap((entry) => listValue(entry.items));
+  const markdownSections = sectionEntries
+    .map((entry) => {
+      const items = listValue(entry.items)
+        .map((item) => `- ${firstNonEmpty(item.title)}: ${firstNonEmpty(item.summary)}`)
+        .join("\n");
+      return `## ${entry.section}\n${items}`;
+    })
+    .join("\n\n");
+
+  if (kind === "cycle_task_plan") {
+    const sections = listValue(productContractCard.sections)
+      .filter(Boolean)
+      .map((section) => ({
+        section,
+        target_items: productContractCard.target_items_per_section || null,
+      }));
+    const cycleTaskPlan = pruneNullish({
+      task_plan: stageGoal
+        ? `Publish the cycle task plan for ${executionStageCard.stage_id || "the current stage"} and dispatch the next work into ${nextStage || "the next stage"}.`
+        : `Publish the cycle task plan and dispatch the next work into ${nextStage || "the next stage"}.`,
+      cycle_goal: firstNonEmpty(groupObjective, stageGoal),
+      current_stage_goal: stageGoal,
+      current_stage_acceptance: listValue(workflowStageCard.notes).filter(Boolean).slice(0, 3),
+      handoff_expectations: nextStage ? [`next_stage=${nextStage}`] : [],
+      sections,
+    });
+    return {
+      kind,
+      ...cycleTaskPlan,
+      cycle_task_plan: cycleTaskPlan,
+    };
+  }
+
+  if (kind === "candidate_material_pool") {
+    return {
+      kind,
+      summary: `Tester-reviewed candidate material pool for ${currentStage || "the current stage"}.`,
+      sections: sectionEntries,
+      items: flatItems,
+      material_pool: flatItems,
+      candidate_materials: flatItems,
+    };
+  }
+
+  if (["product_draft", "revised_product_draft", "final_product_message"].includes(kind)) {
+    return {
+      kind,
+      summary: `${kind.replace(/_/g, " ")} for ${currentStage || "the current stage"}.`,
+      sections: sectionEntries,
+      items: flatItems,
+      draft: markdownSections,
+      body_markdown: markdownSections,
+      report_markdown: markdownSections,
+      product_body: markdownSections,
+    };
+  }
+
+  if (["material_review_feedback", "proofread_feedback", "recheck_feedback"].includes(kind)) {
+    return {
+      kind,
+      summary: `${kind.replace(/_/g, " ")} for ${currentStage || "the current stage"}.`,
+      findings: flatItems.map((item) => ({
+        section: item.section,
+        finding: `${firstNonEmpty(item.title)} is acceptable for the current stage.`,
+      })),
+      approved_items: flatItems,
+      feedback: flatItems.map((item) => ({
+        section: item.section,
+        note: `${firstNonEmpty(item.title)} passed deterministic review.`,
+      })),
+    };
+  }
+
+  if (kind === "publish_decision") {
+    return {
+      kind,
+      decision: "proceed_to_publish",
+      stage_decision: "approved_for_publication",
+      release_decision: "approved",
+      risk_note: "Deterministic publish decision generated from current stage completion.",
+    };
+  }
+
+  if (kind === "product_test_report") {
+    return {
+      kind,
+      summary: `Product test report for ${currentStage || "the current stage"}.`,
+      findings: flatItems.map((item) => ({
+        section: item.section,
+        finding: `${firstNonEmpty(item.title)} is readable and present in the published output.`,
+      })),
+      recommendations: ["Proceed with benchmark and comparison stages."],
+    };
+  }
+
+  if (["benchmark_report", "cross_cycle_report", "product_evaluation_report"].includes(kind)) {
+    return {
+      kind,
+      summary: `${kind.replace(/_/g, " ")} for ${currentStage || "the current stage"}.`,
+      report: markdownSections,
+      report_markdown: markdownSections,
+      findings: flatItems.map((item) => ({
+        section: item.section,
+        finding: `${firstNonEmpty(item.title)} remains within expected quality bounds.`,
+      })),
+      recommendations: ["Carry these findings into the final product report."],
+    };
+  }
+
+  if (kind === "retrospective_plan") {
+    return {
+      kind,
+      summary: `Retrospective plan for ${currentStage || "the current stage"}.`,
+      discussion_points: flatItems.map((item) => `${firstNonEmpty(item.section)}: review ${firstNonEmpty(item.title)}`),
+      action_items: ["Capture validated lessons before retrospective discussion starts."],
+      next_cycle_requirements: ["Preserve the current action-module composition and evidence trail."],
+    };
+  }
+
+  return {};
+}
+
+function stageTransitionIntoCurrentStage(runtimeContext, message = {}) {
+  const currentStage = firstNonEmpty(
+    dictValue(runtimeContext?.execution_stage_card).stage_id,
+    dictValue(runtimeContext?.runtime_session_card).current_stage,
+  );
+  const payload = dictValue(dictValue(message).content?.payload);
+  const messageStatusBlock = {
+    ...dictValue(message.status_block),
+    ...dictValue(payload.status_block || payload.statusBlock),
+  };
+  const incomingStage = firstNonEmpty(messageStatusBlock.step_id, messageStatusBlock.stage_id);
+  if (normalizedSectionToken(firstNonEmpty(message.message_type)) === "group_session") {
+    return true;
+  }
+  return Boolean(currentStage && incomingStage && incomingStage !== currentStage);
+}
+
+function stageParticipantAgentIds(runtimeContext) {
+  const executionStageCard = dictValue(runtimeContext?.execution_stage_card);
+  const workflowStageCard = dictValue(runtimeContext?.workflow_stage_card);
+  const assignmentResolution = dictValue(runtimeContext?.assignment_resolution_card);
+  const currentRole = normalizedSectionToken(
+    firstNonEmpty(dictValue(runtimeContext?.role_card).current_agent_role, dictValue(runtimeContext?.role_card).server_gate_role),
+  );
+  const observeOnly = new Set(listValue(workflowStageCard.observe_only_roles).map((role) => normalizedSectionToken(role)));
+  return listValue(executionStageCard.allowed_roles)
+    .map((role) => normalizedSectionToken(role))
+    .filter((role) => role && role !== currentRole && role !== "manager" && !observeOnly.has(role))
+    .map((role) => firstNonEmpty(assignmentResolution.named_role_agent_ids?.[role]))
+    .filter(Boolean);
+}
+
+function fallbackConsumerFollowUpActionId(incomingActionId, runtimeContext, state) {
+  const expectedKinds = expectedBusinessArtifactKinds(runtimeContext);
+  const currentRole = normalizedSectionToken(
+    firstNonEmpty(dictValue(runtimeContext?.role_card).current_agent_role, dictValue(runtimeContext?.role_card).server_gate_role),
+  );
+  if (
+    incomingActionId === "assign_task" &&
+    expectedKinds.length &&
+    currentRole &&
+    currentRole !== "manager"
+  ) {
+    return "submit_artifact";
+  }
+  return "";
+}
+
+function deterministicOrganizerKickoffExecution(state, runtimeContext, message = {}) {
+  const workflowStageCard = dictValue(runtimeContext?.workflow_stage_card);
+  const organizerRole = normalizedSectionToken(firstNonEmpty(workflowStageCard.organizer_role));
+  const currentRole = normalizedSectionToken(
+    firstNonEmpty(dictValue(runtimeContext?.role_card).current_agent_role, dictValue(runtimeContext?.role_card).server_gate_role),
+  );
+  if (!organizerRole || organizerRole !== currentRole || !stageTransitionIntoCurrentStage(runtimeContext, message)) {
+    return null;
+  }
+  const participantAgentIds = stageParticipantAgentIds(runtimeContext);
+  if (!participantAgentIds.length) {
+    return null;
+  }
+  const currentStage = firstNonEmpty(
+    dictValue(runtimeContext?.execution_stage_card).stage_id,
+    dictValue(runtimeContext?.runtime_session_card).current_stage,
+  );
+  const stageGoal = firstNonEmpty(workflowStageCard.goal, currentStage);
+  const expectedKinds = expectedBusinessArtifactKinds(runtimeContext);
+  return {
+    should_send: true,
+    flow_type: "run",
+    message_type: "analysis",
+    text: [
+      `现在进入 ${currentStage || "current stage"}。`,
+      stageGoal ? `阶段目标：${stageGoal}` : "",
+      `请 ${participantAgentIds.map((id) => `@${id}`).join(" ")} 直接在本线程提交当前阶段所需产物${expectedKinds.length ? `（${expectedKinds.join(", ")}）` : ""}，我会在本阶段内完成审核与打回。`,
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    payload: {
+      action_id: "assign_task",
+      stage_id: currentStage || null,
+      organizer_role: organizerRole,
+      expected_output_kinds: expectedKinds,
+      participant_agent_ids: participantAgentIds,
+      task_summary: stageGoal || currentStage || "current stage handoff",
+    },
+    routing: {
+      target: {
+        agent_id: participantAgentIds[0] || null,
+      },
+      mentions: participantAgentIds.map((agentId) => ({
+        mention_type: "agent",
+        mention_id: agentId,
+        display_text: `@${agentId}`,
+      })),
+    },
+    reason: "deterministic_stage_organizer_kickoff",
+  };
+}
+
+function deterministicStageOwnerKickoffExecution(state, runtimeContext, message = {}) {
+  const workflowStageCard = dictValue(runtimeContext?.workflow_stage_card);
+  const currentRole = normalizedSectionToken(
+    firstNonEmpty(dictValue(runtimeContext?.role_card).current_agent_role, dictValue(runtimeContext?.role_card).server_gate_role),
+  );
+  if (!currentRole || currentRole === "manager" || !stageTransitionIntoCurrentStage(runtimeContext, message)) {
+    return null;
+  }
+  if (!allowsDeterministicArtifactFallback(runtimeContext)) {
+    return null;
+  }
+  const organizerRole = normalizedSectionToken(firstNonEmpty(workflowStageCard.organizer_role));
+  if (organizerRole && organizerRole === currentRole) {
+    return null;
+  }
+  if (!ownerTokenMatchesCurrentRole(firstNonEmpty(workflowStageCard.owner), runtimeContext)) {
+    return null;
+  }
+  const expectedKinds = expectedBusinessArtifactKinds(runtimeContext);
+  const stageArtifactPayload = deterministicStageArtifactScaffold(runtimeContext);
+  if (!expectedKinds.length || !Object.keys(stageArtifactPayload).length) {
+    return null;
+  }
+  const allowedActionModules = listValue(workflowStageCard.allowed_action_modules).map((item) => normalizeActionModuleId(item)).filter(Boolean);
+  const actionId =
+    allowedActionModules.includes("review_artifact") && !allowedActionModules.includes("submit_artifact")
+      ? "review_artifact"
+      : allowedActionModules.includes("submit_artifact")
+        ? "submit_artifact"
+        : "";
+  if (!actionId) {
+    return null;
+  }
+  const preview = renderArtifactPreview(stageArtifactPayload, expectedKinds);
+  const currentStage = firstNonEmpty(
+    dictValue(runtimeContext?.execution_stage_card).stage_id,
+    dictValue(runtimeContext?.runtime_session_card).current_stage,
+  );
+  const baseText =
+    actionId === "review_artifact"
+      ? `我现在对 ${currentStage || "当前阶段"} 的输入产物进行审核并发布本阶段评审结果。`
+      : `我现在提交 ${currentStage || "当前阶段"} 所需产物。`;
+  return {
+    should_send: true,
+    flow_type: "run",
+    message_type: "analysis",
+    text: preview ? appendArtifactPreviewToText(baseText, preview) : baseText,
+    payload: {
+      ...stageArtifactPayload,
+      action_id: actionId,
+    },
+    reason: "deterministic_stage_owner_kickoff",
+  };
+}
+
+function actionModuleConsumerFollowUpFallback(execution, message, runtimeContext = {}, state = {}) {
+  const incomingActionRef = resolveActionModuleReference(message);
+  const incomingContract = dictValue(incomingActionRef.contract);
+  const incomingActionId = firstNonEmpty(incomingActionRef.action_id);
+  const followUpActionId = firstNonEmpty(
+    fallbackConsumerFollowUpActionId(incomingActionId, runtimeContext, state),
+    incomingContract.consumer_follow_up_action_id,
+  );
+  if (!followUpActionId) {
+    return null;
+  }
+
+  const followUpContract = dictValue(getActionModule(followUpActionId));
+  if (!Object.keys(followUpContract).length) {
+    return null;
+  }
+
+  const incomingTitle = firstNonEmpty(incomingContract.title, incomingActionId, "incoming_action");
+  const followUpTitle = firstNonEmpty(followUpContract.title, followUpActionId);
+  const followUpSummary = firstNonEmpty(followUpContract.semantic_meaning, followUpContract.intent);
+  const incomingText = truncateText(firstNonEmpty(dictValue(message?.content).text, message?.text), 160);
+  const baseText = [
+    `收到上一条 ${incomingTitle}。`,
+    `现执行 ${followUpTitle}（${followUpActionId}）完成当前消费者交接。`,
+    followUpSummary ? `本次跟进：${followUpSummary}。` : "",
+    incomingText ? `关联内容：${incomingText}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  const pendingFormalSignal = dictValue(runtimeContext?.pending_formal_signal_card);
+  const expectedKinds = expectedStageArtifactKinds(runtimeContext);
+  const canAttachDeterministicStageArtifact =
+    expectedKinds.length > 0 &&
+    allowsDeterministicArtifactFallback(runtimeContext);
+  const shouldAttachStageArtifact =
+    ["submit_artifact", "review_artifact", "resubmit_artifact"].includes(followUpActionId) ||
+    (
+      followUpActionId === "close_or_handoff" &&
+      normalizedSectionToken(firstNonEmpty(pendingFormalSignal.producer_role)) === "manager"
+    );
+  const stageArtifactPayload =
+    shouldAttachStageArtifact && canAttachDeterministicStageArtifact
+      ? deterministicStageArtifactScaffold(runtimeContext)
+      : {};
+  if (shouldAttachStageArtifact && expectedKinds.length > 0 && !Object.keys(stageArtifactPayload).length) {
+    return null;
+  }
+  const shouldAttachFormalStatus =
+    followUpActionId === "close_or_handoff" &&
+    normalizedSectionToken(firstNonEmpty(pendingFormalSignal.producer_role)) === "manager" &&
+    expectedKinds.length > 0;
+  const stageArtifactPreview =
+    shouldAttachStageArtifact && Object.keys(stageArtifactPayload).length
+      ? renderArtifactPreview(stageArtifactPayload, expectedKinds)
+      : "";
+  const text = stageArtifactPreview ? appendArtifactPreviewToText(baseText, stageArtifactPreview) : baseText;
+  const statusBlock =
+    shouldAttachFormalStatus && Object.keys(stageArtifactPayload).length
+      ? {
+          workflow_id: firstNonEmpty(dictValue(runtimeContext?.runtime_session_card).workflow_id),
+          step_id: firstNonEmpty(
+            pendingFormalSignal.step_id,
+            dictValue(runtimeContext?.execution_stage_card).stage_id,
+            dictValue(runtimeContext?.runtime_session_card).current_stage,
+          ),
+          lifecycle_phase: firstNonEmpty(pendingFormalSignal.lifecycle_phase, "result"),
+          author_role: "manager",
+          author_agent_id: firstNonEmpty(state?.agentId),
+          step_status: firstNonEmpty(pendingFormalSignal.step_status),
+          related_message_id: firstNonEmpty(message?.id),
+        }
+      : dictValue(execution?.status_block);
+
+  return {
+    should_send: true,
+    flow_type: firstNonEmpty(execution?.flow_type, message?.flow_type, "run"),
+    message_type: normalizeOutboundMessageType(firstNonEmpty(execution?.message_type, message?.message_type, "analysis")),
+    text,
+    payload: pruneNullish({
+      ...dictValue(execution?.payload),
+      ...stageArtifactPayload,
+      action_id: followUpActionId,
+      consumer_follow_up_to_action_id: incomingActionId || null,
+      consumer_follow_up_to_message_id: firstNonEmpty(message?.id) || null,
+    }),
+    status_block: statusBlock,
+    context_block: dictValue(execution?.context_block),
+    routing: dictValue(execution?.routing),
+    relations: dictValue(execution?.relations),
+    extensions: {
+      ...dictValue(execution?.extensions),
+      custom: {
+        ...dictValue(dictValue(execution?.extensions).custom),
+        action_id: followUpActionId,
+        consumer_follow_up_fallback: true,
+        consumer_follow_up_to_action_id: incomingActionId || null,
+        stage_artifact_scaffold_attached: shouldAttachStageArtifact && Object.keys(stageArtifactPayload).length > 0,
+      },
+    },
+    reason:
+      shouldAttachStageArtifact && Object.keys(stageArtifactPayload).length
+        ? "action_module_consumer_follow_up_artifactful_close_fallback"
+        : "action_module_consumer_follow_up_fallback",
   };
 }
 
@@ -1470,6 +2727,29 @@ function firstAcceptedStepStatus(...sources) {
   return "";
 }
 
+function uniqueNonEmpty(values = []) {
+  return values.filter(Boolean).filter((value, index, array) => array.indexOf(value) === index);
+}
+
+function actualRoleCandidates(roleCard) {
+  const card = dictValue(roleCard);
+  return uniqueNonEmpty([
+    firstNonEmpty(card.server_gate_role),
+    firstNonEmpty(card.current_agent_role),
+  ]);
+}
+
+function firstFormalStepStatus(source) {
+  const block = dictValue(source);
+  const nestedStatusBlock = dictValue(block.status_block || block.statusBlock);
+  return firstNonEmpty(
+    block.step_status,
+    firstAcceptedStepStatus(block.step_statuses),
+    nestedStatusBlock.step_status,
+    firstAcceptedStepStatus(nestedStatusBlock.step_statuses),
+  );
+}
+
 function canonicalFormalStepStatus(stepStatus, executionStageCard, nextExecutionStageCard, lifecyclePhase, authorRole) {
   const acceptedStatuses = acceptedStageStatuses(executionStageCard, lifecyclePhase, authorRole);
   const nextAcceptedStatuses = acceptedStageStatuses(nextExecutionStageCard, lifecyclePhase, authorRole);
@@ -1527,6 +2807,306 @@ function canonicalFormalStepId(rawStepId, stepStatus, executionStageCard, nextEx
   return firstNonEmpty(explicitStepId, currentStageId, nextStageId);
 }
 
+function preferredFormalAuthorRole(executionStageCard, nextExecutionStageCard, lifecyclePhase, roleCard, ...explicitRoles) {
+  const actualCandidates = actualRoleCandidates(roleCard);
+  const explicitCandidates = uniqueNonEmpty(explicitRoles.map((value) => firstNonEmpty(value)));
+  for (const role of actualCandidates) {
+    if (
+      acceptedStageStatuses(executionStageCard, lifecyclePhase, role).length ||
+      acceptedStageStatuses(nextExecutionStageCard, lifecyclePhase, role).length
+    ) {
+      return role;
+    }
+  }
+  if (!actualCandidates.length) {
+    for (const role of explicitCandidates) {
+      if (
+        acceptedStageStatuses(executionStageCard, lifecyclePhase, role).length ||
+        acceptedStageStatuses(nextExecutionStageCard, lifecyclePhase, role).length
+      ) {
+        return role;
+      }
+    }
+  }
+  return firstNonEmpty(...actualCandidates, ...explicitCandidates);
+}
+
+function pendingFormalSignalForAuthor(runtimeContext, authorRole) {
+  const pending = dictValue(runtimeContext?.pending_formal_signal_card);
+  if (!Object.keys(pending).length) {
+    return {};
+  }
+  if (
+    firstNonEmpty(pending.producer_role) &&
+    firstNonEmpty(pending.producer_role) !== firstNonEmpty(authorRole)
+  ) {
+    return {};
+  }
+  const currentStageId = firstNonEmpty(
+    dictValue(runtimeContext?.execution_stage_card).stage_id,
+    dictValue(runtimeContext?.runtime_session_card).current_stage,
+  );
+  const pendingStepId = firstNonEmpty(pending.step_id, pending.stage_id);
+  if (pendingStepId && currentStageId && pendingStepId !== currentStageId) {
+    return {};
+  }
+  if (!firstNonEmpty(pending.step_status) || !firstNonEmpty(pending.lifecycle_phase)) {
+    return {};
+  }
+  return pending;
+}
+
+function deterministicPendingFormalSignalText(runtimeContext, authorRole) {
+  const stageGoal = firstNonEmpty(
+    dictValue(runtimeContext?.workflow_stage_card).goal,
+    dictValue(runtimeContext?.group_objective_card).group_objective,
+    dictValue(runtimeContext?.runtime_session_card).current_stage,
+  );
+  if (authorRole === "manager") {
+    return stageGoal
+      ? `我已确认当前阶段目标：${stageGoal}，现在按要求继续推进。`
+      : "我已确认当前阶段目标，现按要求继续推进。";
+  }
+  return stageGoal
+    ? `我已理解当前阶段目标与分工：${stageGoal}，将按要求继续推进。`
+    : "我已理解当前阶段目标与分工，将按要求继续推进。";
+}
+
+function bootstrapProductContractLines(runtimeContext) {
+  const productContractCard = dictValue(runtimeContext?.product_contract_card);
+  const lines = [];
+  if (firstNonEmpty(productContractCard.language)) {
+    lines.push(`- 语言：${productContractCard.language}`);
+  }
+  if (listValue(productContractCard.sections).length) {
+    lines.push(`- 板块：${listValue(productContractCard.sections).join("、")}`);
+  }
+  if (productContractCard.target_items_per_section) {
+    lines.push(`- 每板块目标条数：${productContractCard.target_items_per_section}`);
+  }
+  if (firstNonEmpty(productContractCard.news_time_window)) {
+    lines.push(`- 新闻时间窗口：${productContractCard.news_time_window}`);
+  }
+  if (firstNonEmpty(productContractCard.final_delivery_shape)) {
+    lines.push(`- 最终交付：${productContractCard.final_delivery_shape}`);
+  }
+  return lines;
+}
+
+function deterministicBootstrapControlTurnText(runtimeContext) {
+  const bootstrapCard = dictValue(runtimeContext?.bootstrap_control_turn_card);
+  const pendingFormalSignal = dictValue(runtimeContext?.pending_formal_signal_card);
+  const currentStage = firstNonEmpty(bootstrapCard.current_stage, pendingFormalSignal.step_id);
+  const stageGoal = firstNonEmpty(
+    dictValue(runtimeContext?.workflow_stage_card).goal,
+    dictValue(runtimeContext?.group_objective_card).group_objective,
+    currentStage,
+  );
+  const groupObjective = firstNonEmpty(dictValue(runtimeContext?.group_objective_card).group_objective);
+  const assignmentResolution = dictValue(runtimeContext?.assignment_resolution_card);
+  const managerAgentId = firstNonEmpty(assignmentResolution.manager_agent_id);
+  const workerAgentIds = listValue(assignmentResolution.worker_agent_ids).filter(Boolean);
+  const pendingStatus = firstNonEmpty(bootstrapCard.step_status, pendingFormalSignal.step_status);
+  const lines = [];
+
+  if (currentStage === "step0" && pendingStatus === "step0_done") {
+    lines.push("各位协作代理好，现在启动本轮群组协作。");
+    if (groupObjective) {
+      lines.push(`组目标：${groupObjective}`);
+    }
+    const contractLines = bootstrapProductContractLines(runtimeContext);
+    if (contractLines.length) {
+      lines.push("产品要求：");
+      lines.push(...contractLines);
+    }
+    if (managerAgentId) {
+      lines.push(`管理代理：${managerAgentId}`);
+    }
+    if (workerAgentIds.length) {
+      lines.push(`协作代理：${workerAgentIds.join("、")}`);
+    }
+    lines.push("当前阶段：step0 已完成。");
+    lines.push("下一阶段：进入 step1，请所有非管理角色各自发送一条明确的理解对齐消息，并携带正式信号 step1_submitted。");
+    lines.push("step1 期间不进行业务内容生产。");
+    return lines.join("\n");
+  }
+
+  if (currentStage === "step1" && pendingStatus === "step1_start") {
+    lines.push("现在进入 step1（理解对齐阶段）。");
+    lines.push(`阶段目标：${stageGoal}`);
+    lines.push("请所有非管理角色各自发送一条明确的理解对齐消息，并携带正式信号 step1_submitted。");
+    lines.push("manager 只在收齐全部 step1 对齐确认后关闭本阶段。");
+    return lines.join("\n");
+  }
+
+  if (currentStage === "step2" && pendingStatus === "step2_start") {
+    lines.push("现在进入 step2（启动前 readiness 确认阶段）。");
+    lines.push(`阶段目标：${stageGoal}`);
+    lines.push("请所有非管理角色确认可执行性或明确 blocker，并携带正式信号 step2_submitted、step2_ready 或 task_ready 中与当前状态一致的一项。");
+    lines.push("manager 只在收齐全部 readiness 或 blocker 结果后关闭本阶段，并进入 formal_start。");
+    return lines.join("\n");
+  }
+
+  if (currentStage === "formal_start" && pendingStatus === "formal_start") {
+    lines.push("bootstrap 已完成，现在进入 formal_start。");
+    lines.push(`阶段目标：${stageGoal}`);
+    lines.push("manager 现在正式宣布启动业务工作流，并把群组切换到 cycle.start。");
+    lines.push("下一步由 manager 发布本轮 cycle task plan，随后进入 tester 主导的 material.collect。");
+    return lines.join("\n");
+  }
+
+  return deterministicPendingFormalSignalText(runtimeContext, "manager");
+}
+
+function deterministicBootstrapControlTurnExecution(state, runtimeContext, message, judgment = null) {
+  const bootstrapCard = dictValue(runtimeContext?.bootstrap_control_turn_card);
+  const roleCard = dictValue(runtimeContext?.role_card);
+  const executionStageCard = dictValue(runtimeContext?.execution_stage_card);
+  const runtimeSessionCard = dictValue(runtimeContext?.runtime_session_card);
+  const pendingFormalSignal = pendingFormalSignalForAuthor(runtimeContext, "manager");
+  if (
+    firstNonEmpty(roleCard.current_agent_role) !== "manager" ||
+    !Object.keys(bootstrapCard).length ||
+    !bootstrapCard.text_first_control_message_allowed ||
+    !Object.keys(pendingFormalSignal).length
+  ) {
+    return null;
+  }
+  const requiredAgentIds = listValue(pendingFormalSignal.required_agent_ids).filter(Boolean);
+  if (requiredAgentIds.length && state?.agentId && !requiredAgentIds.includes(state.agentId)) {
+    return null;
+  }
+  return {
+    should_send: true,
+    flow_type: firstNonEmpty(pendingFormalSignal.lifecycle_phase),
+    message_type: "analysis",
+    text: deterministicBootstrapControlTurnText(runtimeContext),
+    payload: {
+      action_id: "close_or_handoff",
+      intent: "bootstrap_control_turn",
+      reason: firstNonEmpty(judgment?.obligation?.reason, "server_manager_control_turn"),
+      step_status: firstNonEmpty(pendingFormalSignal.step_status),
+      lifecycle_phase: firstNonEmpty(pendingFormalSignal.lifecycle_phase),
+    },
+    status_block: {
+      workflow_id: firstNonEmpty(runtimeSessionCard.workflow_id),
+      step_id: firstNonEmpty(pendingFormalSignal.step_id, executionStageCard.stage_id, runtimeSessionCard.current_stage),
+      lifecycle_phase: firstNonEmpty(pendingFormalSignal.lifecycle_phase),
+      author_role: "manager",
+      author_agent_id: firstNonEmpty(state?.agentId),
+      step_status: firstNonEmpty(pendingFormalSignal.step_status),
+      related_message_id: firstNonEmpty(message?.id),
+    },
+    reason: "deterministic_bootstrap_control_turn",
+  };
+}
+
+function deterministicPendingFormalSignalExecution(state, runtimeContext, message, execution = null) {
+  const roleCard = dictValue(runtimeContext?.role_card);
+  const executionStageCard = dictValue(runtimeContext?.execution_stage_card);
+  const nextExecutionStageCard = dictValue(runtimeContext?.next_execution_stage_card);
+  const runtimeSessionCard = dictValue(runtimeContext?.runtime_session_card);
+  const pendingRole = firstNonEmpty(dictValue(runtimeContext?.pending_formal_signal_card).producer_role);
+  const lifecyclePhase = firstNonEmpty(dictValue(runtimeContext?.pending_formal_signal_card).lifecycle_phase);
+  const authorRole = preferredFormalAuthorRole(
+    executionStageCard,
+    nextExecutionStageCard,
+    lifecyclePhase,
+    roleCard,
+    pendingRole,
+  );
+  const pendingFormalSignal = pendingFormalSignalForAuthor(runtimeContext, authorRole);
+  if (!Object.keys(pendingFormalSignal).length) {
+    return null;
+  }
+  const requiredAgentIds = listValue(pendingFormalSignal.required_agent_ids).filter(Boolean);
+  if (requiredAgentIds.length && state?.agentId && !requiredAgentIds.includes(state.agentId)) {
+    return null;
+  }
+  const expectedKinds = expectedBusinessArtifactKinds(runtimeContext);
+  const stepStatus = firstNonEmpty(pendingFormalSignal.step_status);
+  if (!stepStatus || !lifecyclePhase) {
+    return null;
+  }
+  if (expectedKinds.length) {
+    if (
+      normalizedSectionToken(authorRole) !== "manager" ||
+      !allowsDeterministicArtifactFallback(runtimeContext)
+    ) {
+      return null;
+    }
+    const stageArtifactPayload = deterministicStageArtifactScaffold(runtimeContext);
+    if (!Object.keys(stageArtifactPayload).length) {
+      return null;
+    }
+    const stageArtifactPreview = renderArtifactPreview(stageArtifactPayload, expectedKinds);
+    const baseText = deterministicPendingFormalSignalText(runtimeContext, authorRole);
+    return {
+      should_send: true,
+      flow_type: lifecyclePhase === "result" ? "result" : lifecyclePhase === "start" ? "start" : "run",
+      message_type: "analysis",
+      text: stageArtifactPreview ? appendArtifactPreviewToText(baseText, stageArtifactPreview) : baseText,
+      payload: stageArtifactPayload,
+      status_block: {
+        workflow_id: firstNonEmpty(runtimeSessionCard.workflow_id),
+        step_id: firstNonEmpty(pendingFormalSignal.step_id, executionStageCard.stage_id, runtimeSessionCard.current_stage),
+        lifecycle_phase: lifecyclePhase,
+        author_role: authorRole,
+        author_agent_id: firstNonEmpty(state?.agentId),
+        step_status: stepStatus,
+        related_message_id: firstNonEmpty(message?.id),
+      },
+      reason: "deterministic_pending_formal_signal_artifact_fallback",
+    };
+  }
+  return {
+    should_send: true,
+    flow_type: lifecyclePhase === "result" ? "result" : lifecyclePhase === "start" ? "start" : "run",
+    message_type: "analysis",
+    text: deterministicPendingFormalSignalText(runtimeContext, authorRole),
+    payload: {},
+    status_block: {
+      workflow_id: firstNonEmpty(runtimeSessionCard.workflow_id),
+      step_id: firstNonEmpty(pendingFormalSignal.step_id, executionStageCard.stage_id, runtimeSessionCard.current_stage),
+      lifecycle_phase: lifecyclePhase,
+      author_role: authorRole,
+      author_agent_id: firstNonEmpty(state?.agentId),
+      step_status: stepStatus,
+      related_message_id: firstNonEmpty(message?.id),
+    },
+    reason: firstNonEmpty(execution?.reason, "deterministic_pending_formal_signal_fallback"),
+  };
+}
+
+function executionSatisfiesPendingFormalSignal(execution, runtimeContext) {
+  const source = dictValue(execution);
+  const roleCard = dictValue(runtimeContext?.role_card);
+  const executionStageCard = dictValue(runtimeContext?.execution_stage_card);
+  const nextExecutionStageCard = dictValue(runtimeContext?.next_execution_stage_card);
+  const pendingRole = firstNonEmpty(dictValue(runtimeContext?.pending_formal_signal_card).producer_role);
+  const lifecyclePhase = firstNonEmpty(dictValue(runtimeContext?.pending_formal_signal_card).lifecycle_phase);
+  const authorRole = preferredFormalAuthorRole(
+    executionStageCard,
+    nextExecutionStageCard,
+    lifecyclePhase,
+    roleCard,
+    pendingRole,
+  );
+  const pendingFormalSignal = pendingFormalSignalForAuthor(runtimeContext, authorRole);
+  if (!Object.keys(pendingFormalSignal).length) {
+    return false;
+  }
+  const statusBlock = dictValue(source.status_block);
+  if (!Object.keys(statusBlock).length) {
+    return false;
+  }
+  return (
+    firstNonEmpty(statusBlock.step_status) === firstNonEmpty(pendingFormalSignal.step_status) &&
+    firstNonEmpty(statusBlock.lifecycle_phase) === firstNonEmpty(pendingFormalSignal.lifecycle_phase) &&
+    firstNonEmpty(statusBlock.author_role, authorRole) === authorRole
+  );
+}
+
 function normalizeOutboundStatusBlock(statusBlock, payload, state, runtimeContext, sendContext = {}) {
   const block = dictValue(statusBlock);
   if (!Object.keys(block).length) {
@@ -1545,22 +3125,25 @@ function normalizeOutboundStatusBlock(statusBlock, payload, state, runtimeContex
   const executionStageCard = dictValue(runtimeContext?.execution_stage_card);
   const nextExecutionStageCard = dictValue(runtimeContext?.next_execution_stage_card);
   const runtimeSessionCard = dictValue(runtimeContext?.runtime_session_card);
-  const lifecyclePhase = firstNonEmpty(
+  let lifecyclePhase = firstNonEmpty(
     block.lifecycle_phase,
     payloadStatus.lifecycle_phase,
     payloadData.lifecycle_phase,
     semantics.lifecycle_phase,
     payload?.flow_type === "result" ? "result" : payload?.flow_type === "start" ? "start" : "run",
   );
-  const authorRole = firstNonEmpty(
-    roleCard.current_agent_role,
-    roleCard.server_gate_role,
+  const authorRole = preferredFormalAuthorRole(
+    executionStageCard,
+    nextExecutionStageCard,
+    lifecyclePhase,
+    roleCard,
     block.author_role,
     payloadStatus.author_role,
     payloadData.author_role,
     semantics.author_role,
   );
-  const stepStatus = canonicalFormalStepStatus(
+  const pendingFormalSignal = pendingFormalSignalForAuthor(runtimeContext, authorRole);
+  let stepStatus = canonicalFormalStepStatus(
     firstNonEmpty(
       block.step_status,
       firstAcceptedStepStatus(block.step_statuses),
@@ -1575,6 +3158,25 @@ function normalizeOutboundStatusBlock(statusBlock, payload, state, runtimeContex
     lifecyclePhase,
     authorRole,
   );
+  const expectedKinds = expectedStageArtifactKinds(runtimeContext);
+  if (
+    Object.keys(pendingFormalSignal).length &&
+    stageCardAcceptsStatus(
+      executionStageCard,
+      pendingFormalSignal.step_status,
+      pendingFormalSignal.lifecycle_phase,
+      authorRole,
+    ) &&
+    (
+      !expectedKinds.length ||
+      firstNonEmpty(pendingFormalSignal.lifecycle_phase) !== "result" ||
+      normalizedSectionToken(firstNonEmpty(authorRole, pendingFormalSignal.producer_role)) !== "manager" ||
+      managerFormalCloseHasEvidence(payload, null, runtimeContext)
+    )
+  ) {
+    lifecyclePhase = firstNonEmpty(pendingFormalSignal.lifecycle_phase, lifecyclePhase);
+    stepStatus = firstNonEmpty(pendingFormalSignal.step_status, stepStatus);
+  }
   return pruneNullish({
     ...payloadStatus,
     ...block,
@@ -1647,8 +3249,201 @@ function payloadHasStructuredArtifact(payload) {
   return artifactKeys.some((key) => hasMeaningfulArtifactValue(source[key]));
 }
 
+function stageArtifactPayload(payload, expectedKinds = []) {
+  const source = dictValue(payload);
+  const kind = firstNonEmpty(source.kind);
+  if (kind && (!expectedKinds.length || expectedKinds.includes(kind))) {
+    return source;
+  }
+  for (const expectedKind of expectedKinds) {
+    const nestedArtifact = dictValue(source[expectedKind]);
+    if (Object.keys(nestedArtifact).length) {
+      return {
+        kind: expectedKind,
+        ...nestedArtifact,
+      };
+    }
+  }
+  return {};
+}
+
+function previewItemLabel(item) {
+  if (typeof item === "string") {
+    return item.trim();
+  }
+  const source = dictValue(item);
+  const title = firstNonEmpty(
+    source.title,
+    source.headline,
+    source.name,
+    source.section,
+    source.summary,
+    source.text,
+    source.decision,
+    source.recommendation,
+    source.finding,
+    source.note,
+    source.source,
+  );
+  if (!title) {
+    return "";
+  }
+  const detail = firstNonEmpty(source.source, source.published_at, source.url);
+  if (detail && detail !== title) {
+    return `${title} (${detail})`;
+  }
+  return title;
+}
+
+function renderPreviewList(label, value, limit = 4) {
+  const items = listValue(value)
+    .map((item) => previewItemLabel(item))
+    .filter(Boolean)
+    .slice(0, limit);
+  if (!items.length) {
+    return "";
+  }
+  return `${label}:\n${items.map((item) => `- ${item}`).join("\n")}`;
+}
+
+function renderSectionsPreview(sections, limit = 4) {
+  const rendered = listValue(sections)
+    .slice(0, limit)
+    .map((sectionEntry) => {
+      const section = dictValue(sectionEntry);
+      const sectionName = firstNonEmpty(section.section, section.name, section.title) || "section";
+      const items = listValue(section.items)
+        .map((item) => previewItemLabel(item))
+        .filter(Boolean)
+        .slice(0, 3);
+      if (!items.length) {
+        return "";
+      }
+      return `${sectionName}:\n${items.map((item) => `- ${item}`).join("\n")}`;
+    })
+    .filter(Boolean);
+  return rendered.join("\n\n");
+}
+
+function truncateArtifactPreview(text, limit = 1600) {
+  const normalized = String(text || "").trim();
+  if (!normalized || normalized.length <= limit) {
+    return normalized;
+  }
+  return `${normalized.slice(0, limit - 1)}…`;
+}
+
+function renderArtifactPreview(payload, expectedKinds = []) {
+  const artifact = stageArtifactPayload(payload, expectedKinds);
+  if (!Object.keys(artifact).length) {
+    return "";
+  }
+  const parts = [];
+  for (const key of ["body_markdown", "report_markdown", "product_body", "report", "draft", "summary", "final_summary", "decision", "stage_decision", "correction_request", "risk_note"]) {
+    const value = artifact[key];
+    if (typeof value === "string" && value.trim()) {
+      parts.push(value.trim());
+    }
+  }
+  const sectionsPreview = renderSectionsPreview(artifact.sections);
+  if (sectionsPreview) {
+    parts.push(sectionsPreview);
+  }
+  for (const [label, key] of [
+    ["items", "items"],
+    ["materials", "materials"],
+    ["candidate_materials", "candidate_materials"],
+    ["material_pool", "material_pool"],
+    ["findings", "findings"],
+    ["feedback", "feedback"],
+    ["approved_items", "approved_items"],
+    ["rejected_items", "rejected_items"],
+    ["recommendations", "recommendations"],
+    ["comparisons", "comparisons"],
+    ["discussion_points", "discussion_points"],
+    ["action_items", "action_items"],
+    ["lessons", "lessons"],
+    ["agenda", "agenda"],
+    ["prompts", "prompts"],
+    ["notes", "notes"],
+    ["rules", "rules"],
+  ]) {
+    const preview = renderPreviewList(label, artifact[key]);
+    if (preview) {
+      parts.push(preview);
+    }
+  }
+  return truncateArtifactPreview(parts.filter(Boolean).join("\n\n"));
+}
+
+function appendArtifactPreviewToText(text, preview) {
+  const base = String(text || "").trim();
+  const artifactPreview = String(preview || "").trim();
+  if (!artifactPreview) {
+    return base;
+  }
+  if (!base) {
+    return artifactPreview;
+  }
+  if (base.includes(artifactPreview)) {
+    return base;
+  }
+  const anchor = artifactPreview
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .find((line) => line.length >= 24);
+  if (anchor && base.includes(anchor)) {
+    return base;
+  }
+  return `${base}\n\n${artifactPreview}`;
+}
+
+function actualManagerAgentIds(runtimeContext) {
+  return uniqueNonEmpty([
+    ...listValue(dictValue(runtimeContext?.role_card).manager_agent_ids),
+    firstNonEmpty(dictValue(runtimeContext?.assignment_resolution_card).manager_agent_id),
+  ]);
+}
+
+function isActualManagerSender(statusBlock, runtimeContext) {
+  const block = dictValue(statusBlock);
+  const roleCard = dictValue(runtimeContext?.role_card);
+  const roleCandidates = actualRoleCandidates(roleCard);
+  const authorAgentId = firstNonEmpty(block.author_agent_id, roleCard.current_agent_id);
+  const managerIds = actualManagerAgentIds(runtimeContext);
+  if (managerIds.length && authorAgentId) {
+    return managerIds.includes(authorAgentId);
+  }
+  return roleCandidates.includes("manager");
+}
+
+function looksLikeManagerSignal(statusBlock) {
+  const block = dictValue(statusBlock);
+  const stepStatus = normalizedSectionToken(firstNonEmpty(block.step_status));
+  return Boolean(
+    stepStatus.startsWith("manager_") ||
+    normalizedSectionToken(firstNonEmpty(block.author_role)) === "manager"
+  );
+}
+
 const STAGE_ARTIFACT_SHAPE_RULES = {
-  cycle_task_plan: ["task_plan", "tasks", "assignments", "section_plans", "workstreams", "sections"],
+  cycle_task_plan: [
+    "task_plan",
+    "tasks",
+    "assignments",
+    "section_plans",
+    "workstreams",
+    "sections",
+    "stages",
+    "stage_decomposition",
+    "worker_assignments",
+    "cycle_goal",
+    "cycle_objective",
+    "current_stage_goal",
+    "current_stage_acceptance",
+    "acceptance_focus_for_material_collect",
+    "handoff_expectations",
+  ],
   candidate_material_pool: ["sections", "items", "materials", "candidate_materials", "material_pool"],
   material_review_feedback: ["findings", "feedback", "approved_items", "rejected_items", "section_reviews"],
   manager_stage_close_or_intra_stage_correction: ["decision", "stage_decision", "correction_request", "forced_proceed", "risk_note"],
@@ -1674,6 +3469,27 @@ function expectedStageArtifactKinds(runtimeContext) {
   return listValue(dictValue(runtimeContext?.workflow_stage_card).output).filter(Boolean);
 }
 
+const TEXT_ONLY_BOOTSTRAP_STAGES = new Set(["step0", "step1", "step2", "formal_start"]);
+
+function expectedBusinessArtifactKinds(runtimeContext) {
+  const runtimeSessionCard = dictValue(runtimeContext?.runtime_session_card);
+  const executionStageCard = dictValue(runtimeContext?.execution_stage_card);
+  const currentMode = firstNonEmpty(runtimeSessionCard.current_mode);
+  const currentStage = firstNonEmpty(executionStageCard.stage_id, runtimeSessionCard.current_stage);
+  if (currentMode === "bootstrap" && TEXT_ONLY_BOOTSTRAP_STAGES.has(currentStage)) {
+    return [];
+  }
+  return expectedStageArtifactKinds(runtimeContext);
+}
+
+function allowsDeterministicArtifactFallback(runtimeContext) {
+  const currentMode = normalizedSectionToken(firstNonEmpty(dictValue(runtimeContext?.runtime_session_card).current_mode));
+  return Boolean(
+    currentMode === "action_module_validation" ||
+    currentMode === "test"
+  );
+}
+
 function payloadMatchesExpectedArtifactKind(payload, expectedKinds) {
   if (!expectedKinds.length) {
     return true;
@@ -1683,21 +3499,33 @@ function payloadMatchesExpectedArtifactKind(payload, expectedKinds) {
 
 function payloadHasExpectedArtifactShape(payload, expectedKinds) {
   const source = dictValue(payload);
-  if (!Object.keys(source).length || !payloadMatchesExpectedArtifactKind(source, expectedKinds)) {
+  if (!Object.keys(source).length) {
     return false;
   }
   const kind = firstNonEmpty(source.kind);
-  const requiredKeys = listValue(STAGE_ARTIFACT_SHAPE_RULES[kind]);
-  if (requiredKeys.length) {
-    return requiredKeys.some((key) => hasMeaningfulArtifactValue(source[key]));
+  if (kind && payloadMatchesExpectedArtifactKind(source, expectedKinds)) {
+    const requiredKeys = listValue(STAGE_ARTIFACT_SHAPE_RULES[kind]);
+    if (requiredKeys.length) {
+      return requiredKeys.some((key) => hasMeaningfulArtifactValue(source[key]));
+    }
+    return payloadHasStructuredArtifact(source);
   }
-  return payloadHasStructuredArtifact(source);
+  return expectedKinds.some((expectedKind) => {
+    const nestedArtifact = dictValue(source[expectedKind]);
+    if (!Object.keys(nestedArtifact).length) {
+      return false;
+    }
+    const requiredKeys = listValue(STAGE_ARTIFACT_SHAPE_RULES[expectedKind]);
+    if (requiredKeys.length) {
+      return requiredKeys.some((key) => hasMeaningfulArtifactValue(nestedArtifact[key]));
+    }
+    return payloadHasStructuredArtifact(nestedArtifact);
+  });
 }
 
 function isManagerFormalClose(statusBlock, runtimeContext) {
   const block = dictValue(statusBlock);
-  const role = firstNonEmpty(block.author_role, dictValue(runtimeContext?.role_card).current_agent_role);
-  if (role !== "manager") {
+  if (!isActualManagerSender(block, runtimeContext)) {
     return false;
   }
   if (firstNonEmpty(block.lifecycle_phase) !== "result") {
@@ -1718,20 +3546,242 @@ function managerFormalCloseHasEvidence(requestBody, incomingMessage, runtimeCont
     if (payloadHasExpectedArtifactShape(payload, expectedKinds)) {
       return true;
     }
-    return payloadHasExpectedArtifactShape(incomingPayload, expectedKinds);
+    if (payloadHasExpectedArtifactShape(incomingPayload, expectedKinds)) {
+      return true;
+    }
+    return false;
   }
+  const explicitEvidenceRefsPresent =
+    hasMeaningfulArtifactValue(payload.evidence_refs) ||
+    hasMeaningfulArtifactValue(payload.artifact_refs) ||
+    hasMeaningfulArtifactValue(incomingPayload.evidence_refs) ||
+    hasMeaningfulArtifactValue(incomingPayload.artifact_refs);
   if (payloadHasStructuredArtifact(payload)) {
     return true;
   }
-  if (hasMeaningfulArtifactValue(payload.evidence_refs) || hasMeaningfulArtifactValue(payload.artifact_refs)) {
+  if (explicitEvidenceRefsPresent) {
     return true;
   }
   return payloadHasStructuredArtifact(incomingPayload);
 }
 
+function payloadHasExplicitManagerOverride(payload) {
+  const source = dictValue(payload);
+  const managerOverride = dictValue(source.manager_stage_close_or_intra_stage_correction);
+  return [
+    source.stage_decision,
+    source.decision,
+    source.forced_proceed,
+    source.correction_request,
+    source.risk_note,
+    managerOverride.stage_decision,
+    managerOverride.decision,
+    managerOverride.forced_proceed,
+    managerOverride.correction_request,
+    managerOverride.risk_note,
+  ].some((value) => hasMeaningfulArtifactValue(value));
+}
+
+function isManagerFinalStageSignal(statusBlock, runtimeContext) {
+  const block = dictValue(statusBlock);
+  if (!isActualManagerSender(block, runtimeContext)) {
+    return false;
+  }
+  const lifecyclePhase = firstNonEmpty(block.lifecycle_phase);
+  if (!["done", "result"].includes(lifecyclePhase)) {
+    return false;
+  }
+  const stepStatus = firstNonEmpty(block.step_status);
+  if (!stepStatus) {
+    return false;
+  }
+  return acceptedStageStatuses(dictValue(runtimeContext?.execution_stage_card), lifecyclePhase, "manager").includes(stepStatus);
+}
+
+function managerFormalCloseBlockedByPendingNonManagerGate(statusBlock, requestBody, runtimeContext) {
+  const normalizedStatusBlock = dictValue(statusBlock);
+  if (!isManagerFinalStageSignal(normalizedStatusBlock, runtimeContext)) {
+    return false;
+  }
+  const pendingFormalSignal = dictValue(runtimeContext?.pending_formal_signal_card);
+  const pendingProducerRole = normalizedSectionToken(firstNonEmpty(pendingFormalSignal.producer_role));
+  if (!pendingProducerRole || pendingProducerRole === "manager") {
+    return false;
+  }
+  const payload = dictValue(requestBody?.content?.payload);
+  return !payloadHasExplicitManagerOverride(payload);
+}
+
+function formalSignalHasArtifactEvidence(requestBody, runtimeContext, incomingMessage = null) {
+  const payload = dictValue(requestBody?.content?.payload);
+  const incomingPayload = dictValue(incomingMessage?.content?.payload);
+  const expectedKinds = expectedStageArtifactKinds(runtimeContext);
+  if (expectedKinds.length) {
+    return (
+      payloadHasExpectedArtifactShape(payload, expectedKinds) ||
+      payloadHasExpectedArtifactShape(incomingPayload, expectedKinds)
+    );
+  }
+  const explicitEvidenceRefsPresent =
+    hasMeaningfulArtifactValue(payload.evidence_refs) ||
+    hasMeaningfulArtifactValue(payload.artifact_refs) ||
+    hasMeaningfulArtifactValue(incomingPayload.evidence_refs) ||
+    hasMeaningfulArtifactValue(incomingPayload.artifact_refs);
+  return payloadHasStructuredArtifact(payload) || payloadHasStructuredArtifact(incomingPayload) || explicitEvidenceRefsPresent;
+}
+
+function isDuplicateCurrentAgentFormalSignal(statusBlock, state, runtimeContext) {
+  const block = dictValue(statusBlock);
+  const observedStatuses = listValue(runtimeContext?.__current_agent_observed_statuses);
+  const authorAgentId = firstNonEmpty(block.author_agent_id, state?.agentId);
+  if (!Object.keys(block).length || !observedStatuses.length || !authorAgentId) {
+    return false;
+  }
+  return hasObservedFormalStatus(observedStatuses, {
+    step_id: firstNonEmpty(
+      block.step_id,
+      dictValue(runtimeContext?.execution_stage_card).stage_id,
+      dictValue(runtimeContext?.runtime_session_card).current_stage,
+    ),
+    lifecycle_phase: firstNonEmpty(block.lifecycle_phase),
+    step_status: firstNonEmpty(block.step_status),
+    author_agent_id: authorAgentId,
+  }, authorAgentId);
+}
+
+function suppressOutboundFormalSignal(requestBody, reason) {
+  const content = dictValue(requestBody?.content);
+  const payload = dictValue(content.payload);
+  const nextPayload = { ...payload };
+  delete nextPayload.status_block;
+  delete nextPayload.statusBlock;
+  return {
+    ...requestBody,
+    content: {
+      ...content,
+      payload: nextPayload,
+    },
+    status_block: {},
+    extensions: {
+      ...dictValue(requestBody?.extensions),
+      custom: {
+        ...dictValue(dictValue(requestBody?.extensions).custom),
+        formal_signal_suppressed_reason: firstNonEmpty(reason),
+      },
+    },
+  };
+}
+
+function enrichVisibleArtifactBody(requestBody, runtimeContext) {
+  const content = dictValue(requestBody?.content);
+  const payload = dictValue(content.payload);
+  const expectedKinds = expectedStageArtifactKinds(runtimeContext);
+  const preview = renderArtifactPreview(payload, expectedKinds);
+  if (!preview) {
+    return requestBody;
+  }
+  const nextText = appendArtifactPreviewToText(content.text, preview);
+  if (nextText === firstNonEmpty(content.text)) {
+    return requestBody;
+  }
+  return {
+    ...requestBody,
+    content: {
+      ...content,
+      text: nextText,
+    },
+  };
+}
+
+function isDuplicateManagerStageStart(statusBlock, runtimeContext = {}) {
+  const block = dictValue(statusBlock);
+  if (!Object.keys(block).length) {
+    return false;
+  }
+  const stepStatus = firstNonEmpty(block.step_status);
+  if (!stepStatus || firstNonEmpty(block.lifecycle_phase) !== "start") {
+    return false;
+  }
+  const authorRole = normalizedSectionToken(
+    firstNonEmpty(block.author_role, dictValue(runtimeContext?.role_card).current_agent_role),
+  );
+  const managerLikeStartToken = normalizedSectionToken(stepStatus).startsWith("manager_");
+  if (authorRole !== "manager" && !managerLikeStartToken) {
+    return false;
+  }
+  const runtimeSession = dictValue(runtimeContext?.runtime_session_card);
+  const lastStatusBlock = dictValue(runtimeSession.last_status_block);
+  if (!Object.keys(lastStatusBlock).length) {
+    return false;
+  }
+  const currentStageId = firstNonEmpty(
+    dictValue(runtimeContext?.execution_stage_card).stage_id,
+    runtimeSession.current_stage,
+  );
+  const stepId = firstNonEmpty(block.step_id, currentStageId);
+  return Boolean(
+    stepId &&
+    currentStageId &&
+    stepId === currentStageId &&
+    firstNonEmpty(lastStatusBlock.step_id) === stepId &&
+    firstNonEmpty(lastStatusBlock.lifecycle_phase) === "start" &&
+    normalizedSectionToken(firstNonEmpty(lastStatusBlock.author_role)) === "manager" &&
+    firstNonEmpty(lastStatusBlock.step_status) === stepStatus
+  );
+}
+
+async function fetchLiveLastStatusBlock(groupId, state) {
+  const normalizedGroupId = String(groupId || "").trim();
+  if (!normalizedGroupId) {
+    return {};
+  }
+  try {
+    const payload = await request(`/groups/${normalizedGroupId}/session`, { method: "GET", token: state.token });
+    const session = dictValue(payload?.data || payload);
+    const stateJson = dictValue(session.state_json);
+    const block = dictValue(stateJson.last_status_block);
+    if (!Object.keys(block).length) {
+      return {};
+    }
+    return pruneNullish({
+      step_id: firstNonEmpty(block.step_id, block.stage_id) || null,
+      lifecycle_phase: firstNonEmpty(block.lifecycle_phase) || null,
+      author_role: firstNonEmpty(block.author_role) || null,
+      author_agent_id: firstNonEmpty(block.author_agent_id) || null,
+      step_status: firstFormalStepStatus(block) || null,
+      related_message_id: firstNonEmpty(block.related_message_id) || null,
+    }) || {};
+  } catch {
+    return {};
+  }
+}
+
+function isDuplicateManagerStageStartFromLiveSession(statusBlock, lastStatusBlock = {}, currentStageId = "") {
+  const block = dictValue(statusBlock);
+  const previous = dictValue(lastStatusBlock);
+  if (!Object.keys(block).length || !Object.keys(previous).length) {
+    return false;
+  }
+  const stepStatus = firstNonEmpty(block.step_status);
+  const stepId = firstNonEmpty(block.step_id, currentStageId);
+  const managerLikeStartToken = normalizedSectionToken(stepStatus).startsWith("manager_");
+  return Boolean(
+    stepStatus &&
+    stepId &&
+    firstNonEmpty(block.lifecycle_phase) === "start" &&
+    (normalizedSectionToken(firstNonEmpty(block.author_role)) === "manager" || managerLikeStartToken) &&
+    stepId === currentStageId &&
+    firstNonEmpty(previous.step_id) === stepId &&
+    firstNonEmpty(previous.lifecycle_phase) === "start" &&
+    normalizedSectionToken(firstNonEmpty(previous.author_role)) === "manager" &&
+    firstNonEmpty(previous.step_status) === stepStatus
+  );
+}
+
 async function enrichOutboundFormalMessage(requestBody, state, sendContext = {}) {
   const statusBlock = dictValue(requestBody?.status_block);
-  if (!Object.keys(statusBlock).length) {
+  const needsAssignmentRouting = payloadHasGenericWorkerAssignments(requestBody?.content?.payload);
+  if (!Object.keys(statusBlock).length && !needsAssignmentRouting) {
     return requestBody;
   }
   let runtimeContext = {};
@@ -1742,108 +3792,164 @@ async function enrichOutboundFormalMessage(requestBody, state, sendContext = {})
       runtimeContext = {};
     }
   }
+  let nextRequestBody = requestBody;
+  if (Object.keys(runtimeContext).length) {
+    nextRequestBody = enrichOutboundAssignmentRouting(nextRequestBody, runtimeContext);
+  }
+  if (!Object.keys(statusBlock).length) {
+    return nextRequestBody;
+  }
   if (!Object.keys(runtimeContext).length) {
     if (!missingFormalStatusFields(statusBlock).length && !isGenericFormalStepStatus(statusBlock.step_status)) {
-      return requestBody;
+      return nextRequestBody;
     }
-    return requestBody;
+    return nextRequestBody;
   }
-  const normalizedStatusBlock = normalizeOutboundStatusBlock(statusBlock, requestBody, state, runtimeContext, sendContext);
+  const normalizedStatusBlock = normalizeOutboundStatusBlock(
+    dictValue(nextRequestBody?.status_block),
+    nextRequestBody,
+    state,
+    runtimeContext,
+    sendContext,
+  );
+  const requestedManagerSignal = looksLikeManagerSignal(
+    dictValue(nextRequestBody?.status_block).step_status || dictValue(nextRequestBody?.status_block).author_role
+      ? dictValue(nextRequestBody?.status_block)
+      : dictValue(dictValue(nextRequestBody?.content).payload.status_block || dictValue(nextRequestBody?.content).payload.statusBlock),
+  );
+  if (requestedManagerSignal && !isActualManagerSender({ author_agent_id: state?.agentId }, runtimeContext)) {
+    return suppressOutboundFormalSignal(nextRequestBody, "non_manager_manager_signal");
+  }
   if (!Object.keys(normalizedStatusBlock).length) {
     return {
-      ...requestBody,
+      ...nextRequestBody,
       status_block: {},
     };
   }
-  if (isManagerFormalClose(normalizedStatusBlock, runtimeContext) && !managerFormalCloseHasEvidence(requestBody, sendContext.incoming_message, runtimeContext)) {
-    return {
-      ...requestBody,
-      status_block: {},
-      extensions: {
-        ...dictValue(requestBody.extensions),
-        custom: {
-          ...dictValue(dictValue(requestBody.extensions).custom),
-          formal_signal_suppressed_reason: "missing_stage_artifact_evidence",
-        },
-      },
-    };
+  if (
+    isDuplicateCurrentAgentFormalSignal(normalizedStatusBlock, state, runtimeContext) &&
+    !formalSignalHasArtifactEvidence(nextRequestBody, runtimeContext, sendContext.incoming_message)
+  ) {
+    return suppressOutboundFormalSignal(nextRequestBody, "duplicate_current_agent_formal_status");
   }
-  return {
-    ...requestBody,
+  const liveLastStatusBlock = await fetchLiveLastStatusBlock(nextRequestBody?.group_id, state);
+  const currentStageId = firstNonEmpty(
+    normalizedStatusBlock.step_id,
+    dictValue(runtimeContext?.execution_stage_card).stage_id,
+    dictValue(runtimeContext?.runtime_session_card).current_stage,
+  );
+  if (
+    isDuplicateManagerStageStart(normalizedStatusBlock, runtimeContext) ||
+    isDuplicateManagerStageStartFromLiveSession(normalizedStatusBlock, liveLastStatusBlock, currentStageId)
+  ) {
+    return suppressOutboundFormalSignal(nextRequestBody, "duplicate_manager_stage_start");
+  }
+  if (managerFormalCloseBlockedByPendingNonManagerGate(normalizedStatusBlock, nextRequestBody, runtimeContext)) {
+    return suppressOutboundFormalSignal(nextRequestBody, "pending_non_manager_gate");
+  }
+  if (
+    isManagerFormalClose(normalizedStatusBlock, runtimeContext) &&
+    !managerFormalCloseHasEvidence(nextRequestBody, sendContext.incoming_message, runtimeContext)
+  ) {
+    return suppressOutboundFormalSignal(nextRequestBody, "missing_stage_artifact_evidence");
+  }
+  const normalizedRequestBody = {
+    ...nextRequestBody,
     status_block: normalizedStatusBlock,
   };
+  if (isManagerFormalClose(normalizedStatusBlock, runtimeContext)) {
+    return enrichVisibleArtifactBody(normalizedRequestBody, runtimeContext);
+  }
+  return normalizedRequestBody;
 }
 
 async function executeTask(message, state, runtimeContext, judgment = null) {
-  const model = loadModelConfig();
-  const endpoint = `${model.baseUrl}/chat/completions`;
-  const headers = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${model.apiKey}`,
-  };
   const requestBody = {
-    model: model.modelId,
     messages: buildExecutionPrompt(message, state, runtimeContext, judgment),
     temperature: 0.4,
     response_format: { type: "json_object" },
   };
-  let response = await fetch(endpoint, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(requestBody),
-    signal: signalWithTimeout(60000),
-  });
-  let payload = await response.json();
-  const responseFormatUnsupported =
-    !response.ok &&
-    String(payload?.error?.code || "").trim() === "InvalidParameter" &&
-    String(payload?.error?.param || "").trim() === "response_format.type";
-  if (responseFormatUnsupported) {
-    const fallbackBody = { ...requestBody };
-    delete fallbackBody.response_format;
-    response = await fetch(endpoint, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(fallbackBody),
-      signal: signalWithTimeout(60000),
-    });
-    payload = await response.json();
-  }
-  if (!response.ok) {
-    throw new Error(`Model request failed: ${JSON.stringify(payload)}`);
-  }
+  const payload = await requestModelJson(requestBody);
   const raw = payload.choices?.[0]?.message?.content?.trim() || "";
   const parsed = extractJsonObject(raw);
   if (parsed) {
-    return enrichExecutionStatusBlock(normalizeExecutionDecision(parsed, raw), state, runtimeContext, message);
+    return enrichExecutionStatusBlock(
+      normalizeConsumerFollowUpDecision(
+        normalizeExecutionDecision(parsed, raw),
+        state,
+        message,
+        runtimeContext,
+      ),
+      state,
+      runtimeContext,
+      message,
+    );
   }
-  return enrichExecutionStatusBlock(normalizeExecutionDecision(
-    {
-      should_send: Boolean(raw),
-      flow_type: "run",
-      message_type: "analysis",
-      text: raw,
-      payload: {},
-      reason: "unstructured_model_output",
-    },
-    raw,
-  ), state, runtimeContext, message);
+  return enrichExecutionStatusBlock(
+    normalizeConsumerFollowUpDecision(
+      normalizeExecutionDecision(
+        {
+          should_send: Boolean(raw),
+          flow_type: "run",
+          message_type: "analysis",
+          text: raw,
+          payload: {},
+          reason: "unstructured_model_output",
+        },
+        raw,
+      ),
+      state,
+      message,
+      runtimeContext,
+    ),
+    state,
+    runtimeContext,
+    message,
+  );
 }
 
 export async function fetchRuntimeContext(groupId, state) {
-  const [protocolData, channelData, sessionData] = await Promise.all([
+  const [protocolResult, channelResult, sessionResult] = await Promise.allSettled([
     request(`/groups/${groupId}/protocol`, { method: "GET", token: state.token }),
     request(`/groups/${groupId}/context`, { method: "GET", token: state.token }),
     request(`/groups/${groupId}/session`, { method: "GET", token: state.token }),
   ]);
-  await loadGroupContext(state, groupId, channelData);
+  const protocolData = protocolResult.status === "fulfilled" ? protocolResult.value : {};
+  const channelData = channelResult.status === "fulfilled" ? channelResult.value : {};
+  const sessionData = sessionResult.status === "fulfilled" ? sessionResult.value : {};
+  if (channelResult.status === "fulfilled") {
+    await loadGroupContext(state, groupId, channelData);
+  }
+  if (
+    protocolResult.status !== "fulfilled" &&
+    channelResult.status !== "fulfilled" &&
+    sessionResult.status !== "fulfilled"
+  ) {
+    throw new Error(`failed to fetch runtime context for ${groupId}`);
+  }
   const protocolEnvelope = protocolData?.data?.protocol || protocolData?.protocol || protocolData || null;
+  const envelopeGroupLayer = dictValue(protocolEnvelope?.layers?.group);
+  const protocolGroupLayer = Object.keys(envelopeGroupLayer).length ? envelopeGroupLayer : resolveProtocolGroupLayer(protocolData);
+  const channelGroupLayer = resolveProtocolGroupLayer(channelData);
+  const storedWorkflowPayload = dictValue(storedPayloadForGroup(WORKFLOW_CONTRACT_PATH, groupId));
+  const storedWorkflowGroupLayer = dictValue(storedWorkflowPayload.contract || storedWorkflowPayload);
   const groupLayer =
-    protocolEnvelope?.layers?.group ||
-    protocolData?.data?.group?.metadata_json?.community_v2?.group_protocol ||
-    protocolData?.group?.metadata_json?.community_v2?.group_protocol ||
-    protocolData?.group_protocol ||
-    {};
+    Object.keys(protocolGroupLayer).length
+      ? protocolGroupLayer
+      : Object.keys(channelGroupLayer).length
+        ? channelGroupLayer
+        : storedWorkflowGroupLayer;
+  if (Object.keys(groupLayer).length) {
+    loadWorkflowContract(
+      groupId,
+      groupLayer,
+      Object.keys(protocolGroupLayer).length
+        ? "protocol_endpoint"
+        : Object.keys(channelGroupLayer).length
+          ? "context_endpoint"
+          : "cached_contract",
+    );
+  }
   const session = sessionData?.data || sessionData || null;
   const members = dictValue(groupLayer?.members);
   const roleAssignments = dictValue(members.role_assignments);
@@ -1864,14 +3970,26 @@ export async function fetchRuntimeContext(groupId, state) {
     currentAgentRole = "worker";
   }
   const stageCards = stageCardsFor(groupLayer, executionSpec, session?.current_stage);
-  return {
+  const roleCard = roleCardForAgent(groupLayer, executionSpec, state, currentAgentRole, workerAgentIds);
+  const assignmentResolution = assignmentResolutionCard(groupLayer, state, workerAgentIds);
+  const executionStageCard = {
+    ...stageCards.execution_stage_card,
+    execution_spec_id: executionSpec.execution_spec_id || session?.gate_snapshot?.execution_spec_id || null,
+  };
+  const runtimeSession = runtimeSessionCard(session);
+  const pendingFormalSignal = pendingFormalSignalCard(session);
+  const currentAgentObservedStatuses = compactObservedFormalStatuses(
+    dictValue(session?.state_json).observed_statuses,
+    state?.agentId,
+  );
+  const runtimeContext = {
     protocol_version: protocolEnvelope?.version || groupLayer?.protocol_meta?.protocol_version || session?.protocol_version || "unknown",
     group_slug:
       channelData?.data?.group?.slug ||
       channelData?.group_slug ||
       groupLayer?.group?.group_slug ||
       "",
-    role_card: roleCardForAgent(groupLayer, executionSpec, state, currentAgentRole, workerAgentIds),
+    role_card: roleCard,
     group_objective_card: {
       group_type: groupLayer?.group_identity?.group_type || null,
       workflow_mode: groupLayer?.group_identity?.workflow_mode || null,
@@ -1879,13 +3997,17 @@ export async function fetchRuntimeContext(groupId, state) {
     },
     product_contract_card: productContractCard(groupLayer),
     workflow_stage_card: stageCards.workflow_stage_card,
-    execution_stage_card: {
-      ...stageCards.execution_stage_card,
-      execution_spec_id: executionSpec.execution_spec_id || session?.gate_snapshot?.execution_spec_id || null,
-    },
+    execution_stage_card: executionStageCard,
     next_execution_stage_card: stageCards.next_execution_stage_card,
-    runtime_session_card: runtimeSessionCard(session),
+    runtime_session_card: runtimeSession,
+    pending_formal_signal_card: pendingFormalSignal,
+    assignment_resolution_card: assignmentResolution,
     transition_rules_card: transitionRulesCard(groupLayer),
+    __current_agent_observed_statuses: currentAgentObservedStatuses,
+  };
+  return {
+    ...runtimeContext,
+    bootstrap_control_turn_card: bootstrapControlTurnCard(runtimeContext),
   };
 }
 
@@ -1912,6 +4034,17 @@ function inferFlowType(messageType, intent) {
     return "status";
   }
   return "run";
+}
+
+function normalizeOutboundFlowType(flowType, messageType = "", intent = "") {
+  const lowered = String(flowType || "").trim().toLowerCase();
+  if (["start", "run", "result", "status"].includes(lowered)) {
+    return lowered;
+  }
+  if (["done", "complete", "completed", "close", "closed", "finish", "finished"].includes(lowered)) {
+    return "result";
+  }
+  return inferFlowType(messageType, intent);
 }
 
 function normalizeOutboundMessageType(messageType) {
@@ -1946,6 +4079,68 @@ function structuredMentionForTarget(targetAgentId, targetAgent) {
     mention_type: "agent",
     mention_id: targetAgentId,
     display_text: displayText,
+  };
+}
+
+function workerAliasMap(runtimeContext) {
+  return dictValue(dictValue(runtimeContext?.assignment_resolution_card).worker_alias_to_agent_id);
+}
+
+function payloadHasGenericWorkerAssignments(payload) {
+  const assignments = dictValue(dictValue(payload).worker_assignments);
+  return Object.keys(assignments).some((key) => /^worker_[a-z]$/i.test(String(key || "").trim()));
+}
+
+function enrichOutboundAssignmentRouting(requestBody, runtimeContext) {
+  const body = requestBody && typeof requestBody === "object" ? requestBody : {};
+  const content = dictValue(body.content);
+  const payload = dictValue(content.payload);
+  const workerAssignments = dictValue(payload.worker_assignments);
+  const aliasMap = workerAliasMap(runtimeContext);
+  if (!Object.keys(workerAssignments).length || !Object.keys(aliasMap).length) {
+    return body;
+  }
+
+  let changed = false;
+  const resolvedAssignments = {
+    ...dictValue(payload.resolved_worker_assignments),
+  };
+  const mentions = [...listValue(dictValue(body.routing).mentions)];
+
+  for (const [alias, assignment] of Object.entries(workerAssignments)) {
+    const agentId = firstNonEmpty(aliasMap[alias]);
+    if (!agentId) {
+      continue;
+    }
+    resolvedAssignments[agentId] = assignment;
+    const mention = structuredMentionForTarget(agentId, agentId);
+    if (mention && !mentions.some((item) => item && item.mention_id === mention.mention_id)) {
+      mentions.push(mention);
+    }
+    changed = true;
+  }
+
+  if (!changed) {
+    return body;
+  }
+
+  return {
+    ...body,
+    content: {
+      ...content,
+      payload: {
+        ...payload,
+        worker_assignment_aliases: {
+          ...workerAliasMap(runtimeContext),
+          ...dictValue(payload.worker_assignment_aliases),
+        },
+        resolved_worker_assignments: resolvedAssignments,
+      },
+    },
+    routing: {
+      ...dictValue(body.routing),
+      mentions,
+    },
   };
 }
 
@@ -2020,11 +4215,13 @@ function canonicalMessageFromPayload(sendContext, payload, state) {
 
   const normalizedText = firstNonEmpty(body.text, legacyContent.text);
   const normalizedIntent = firstNonEmpty(semantics.intent, legacyContent.intent, legacyMetadata.intent, inferIntentFromText(normalizedText));
-  const normalizedFlowType =
-    firstNonEmpty(source.flow_type, semantics.flow_type, legacyMetadata.flow_type) ||
-    inferFlowType(source.message_type || semantics.message_type, normalizedIntent);
   const normalizedMessageType = normalizeOutboundMessageType(
     source.message_type || semantics.message_type || legacyMetadata.message_type || "analysis",
+  );
+  const normalizedFlowType = normalizeOutboundFlowType(
+    firstNonEmpty(source.flow_type, semantics.flow_type, legacyMetadata.flow_type),
+    normalizedMessageType,
+    normalizedIntent,
   );
   const outboundCorrelationId = firstNonEmpty(
     extensions.outbound_correlation_id,
@@ -2047,7 +4244,7 @@ function canonicalMessageFromPayload(sendContext, payload, state) {
     mentions.push(mention);
   }
 
-  return pruneNullish({
+  const canonicalMessage = pruneNullish({
     group_id: sendContext.group_id,
     author: {
       agent_id: state?.agentId || null,
@@ -2087,6 +4284,16 @@ function canonicalMessageFromPayload(sendContext, payload, state) {
       },
     },
   });
+  const resolution = resolveActionModuleReference({
+    ...canonicalMessage,
+    action_id: firstNonEmpty(source.action_id, legacyPayload.action_id, custom.action_id),
+  });
+  return {
+    ...canonicalMessage,
+    ...(resolution.action_id ? { action_id: resolution.action_id } : {}),
+    content: resolution.content,
+    extensions: resolution.extensions,
+  };
 }
 
 function extractJsonObject(text) {
@@ -2184,6 +4391,27 @@ export async function sendCommunityMessage(state, incomingMessage, payload) {
   const sendContext = buildSendContext(state, incomingMessage, payload);
   let requestBody = buildCommunityMessage(state, sendContext, payload);
   requestBody = await enrichOutboundFormalMessage(requestBody, state, sendContext);
+  const outboundStatusBlock = dictValue(requestBody?.status_block);
+  if (Object.keys(outboundStatusBlock).length && requestBody?.group_id) {
+    try {
+      const liveLastStatusBlock = await fetchLiveLastStatusBlock(requestBody.group_id, state);
+      const duplicateLiveManagerStart = Boolean(
+        firstNonEmpty(outboundStatusBlock.lifecycle_phase) === "start" &&
+        normalizedSectionToken(firstNonEmpty(outboundStatusBlock.step_status)).startsWith("manager_") &&
+        firstNonEmpty(liveLastStatusBlock.lifecycle_phase) === "start" &&
+        firstNonEmpty(liveLastStatusBlock.step_status) === firstNonEmpty(outboundStatusBlock.step_status) &&
+        (
+          !firstNonEmpty(outboundStatusBlock.step_id) ||
+          firstNonEmpty(liveLastStatusBlock.step_id) === firstNonEmpty(outboundStatusBlock.step_id)
+        )
+      );
+      if (duplicateLiveManagerStart) {
+        requestBody = suppressOutboundFormalSignal(requestBody, "duplicate_manager_stage_start");
+      }
+    } catch {
+      // Keep outbound hot path resilient if live session refresh fails.
+    }
+  }
   const outboundText = String(requestBody?.content?.text || "").trim();
   if (!requestBody?.group_id || !outboundText) {
     recordInvalidOutbound("invalid_outbound_payload", {
@@ -2205,14 +4433,27 @@ export async function sendCommunityMessage(state, incomingMessage, payload) {
 }
 
 function canonicalMessageForExecution(runtimeMessage) {
+  const payload = dictValue(runtimeMessage?.payload);
+  const statusBlock = dictValue(runtimeMessage?.status_block);
+  const contextBlock = dictValue(runtimeMessage?.context_block);
+  const actionId = firstNonEmpty(runtimeMessage?.action_id, payload.action_id);
+  const nextPayload = {
+    ...payload,
+    ...(actionId ? { action_id: actionId } : {}),
+    ...(Object.keys(statusBlock).length ? { status_block: statusBlock } : {}),
+    ...(Object.keys(contextBlock).length ? { context_block: contextBlock } : {}),
+  };
   return {
     id: runtimeMessage?.id || null,
     group_id: runtimeMessage?.group_id || null,
     flow_type: runtimeMessage?.flow_type || "run",
     message_type: runtimeMessage?.message_type || "analysis",
+    action_id: actionId || null,
+    status_block: Object.keys(statusBlock).length ? statusBlock : undefined,
+    context_block: Object.keys(contextBlock).length ? contextBlock : undefined,
     content: {
       text: runtimeMessage?.text || "",
-      payload: runtimeMessage?.payload || {},
+      payload: nextPayload,
     },
     relations: {
       thread_id: runtimeMessage?.thread_id || null,
@@ -2241,61 +4482,47 @@ function incomingMessageForRuntime(runtimeMessage) {
 }
 
 async function deliberateCommunityResponse(message, state, runtimeContext, judgment) {
-  const model = loadModelConfig();
   const identity = loadText(preferredAssetPath("IDENTITY.md"));
   const soul = loadText(preferredAssetPath("SOUL.md"));
   const user = loadText(preferredAssetPath("USER.md"));
   const agentProtocol = installedAgentProtocolText();
-  const response = await fetch(`${model.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${model.apiKey}`,
-    },
-    body: JSON.stringify({
-      model: model.modelId,
-      messages: [
-        {
-          role: "system",
-          content: [
-            `You are the OpenClaw community collaboration agent ${state.profile?.display_name || state.agentName}.`,
-            "You are now in the agent deliberation layer.",
-            "Runtime already judged minimum obligation. You must decide whether to publicly reply in the same group.",
-            "Return JSON only with fields: should_reply (boolean), reply_text (string), message_type (string), reason (string).",
-            "If obligation is required, should_reply must be true unless the message is malformed or impossible to answer.",
-            "If obligation is optional, you may choose not to reply.",
-            "reply_text must be concise Chinese suitable for public community posting.",
-            "Do not expose chain-of-thought. Do not restate the whole protocol.",
-            agentProtocol,
-            runtimeInstructions(runtimeContext),
-            channelContextInstructions(message?.group_id),
-            workflowContractInstructions(message?.group_id),
-            "Current runtime judgment:",
-            JSON.stringify(judgment, null, 2),
-            "Identity and working context:",
-            identity,
-            soul,
-            user,
-          ].filter(Boolean).join("\n\n"),
-        },
-        {
-          role: "user",
-          content: [
-            "Decide whether to reply to the following community message.",
-            `message_type: ${message.message_type}`,
-            `message_content: ${JSON.stringify(message.content, null, 2)}`,
-          ].join("\n\n"),
-        },
-      ],
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-    }),
-    signal: signalWithTimeout(60000),
+  const payload = await requestModelJson({
+    messages: [
+      {
+        role: "system",
+        content: [
+          `You are the OpenClaw community collaboration agent ${state.profile?.display_name || state.agentName}.`,
+          "You are now in the agent deliberation layer.",
+          "Runtime already judged minimum obligation. You must decide whether to publicly reply in the same group.",
+          "Return JSON only with fields: should_reply (boolean), reply_text (string), message_type (string), reason (string).",
+          "If obligation is required, should_reply must be true unless the message is malformed or impossible to answer.",
+          "If obligation is optional, you may choose not to reply.",
+          "reply_text must be concise Chinese suitable for public community posting.",
+          "Do not expose chain-of-thought. Do not restate the whole protocol.",
+          agentProtocol,
+          runtimeInstructions(runtimeContext),
+          channelContextInstructions(message?.group_id),
+          workflowContractInstructions(message?.group_id),
+          "Current runtime judgment:",
+          JSON.stringify(judgment, null, 2),
+          "Identity and working context:",
+          identity,
+          soul,
+          user,
+        ].filter(Boolean).join("\n\n"),
+      },
+      {
+        role: "user",
+        content: [
+          "Decide whether to reply to the following community message.",
+          `message_type: ${message.message_type}`,
+          `message_content: ${JSON.stringify(message.content, null, 2)}`,
+        ].join("\n\n"),
+      },
+    ],
+    temperature: 0.2,
+    response_format: { type: "json_object" },
   });
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(`Model deliberation failed: ${JSON.stringify(payload)}`);
-  }
   const raw = payload.choices?.[0]?.message?.content?.trim() || "";
   const parsed = extractJsonObject(raw) || {};
   return {
@@ -2307,9 +4534,11 @@ async function deliberateCommunityResponse(message, state, runtimeContext, judgm
   };
 }
 
-async function executeRuntimeJudgment(state, judgment) {
+export async function executeRuntimeJudgment(state, judgment) {
   const obligation = String(judgment?.obligation?.obligation || "observe_only").trim().toLowerCase();
   const runtimeMessage = judgment?.message || {};
+  const effectiveGroupId = firstNonEmpty(runtimeMessage?.group_id, judgment?.context_group_id) || null;
+  const scopedRuntimeMessage = effectiveGroupId ? { ...runtimeMessage, group_id: effectiveGroupId } : runtimeMessage;
   const recommendationMode = String(judgment?.recommendation?.mode || "observe_only").trim().toLowerCase();
 
   if (recommendationMode === "observe_only" || obligation === "observe_only") {
@@ -2324,29 +4553,126 @@ async function executeRuntimeJudgment(state, judgment) {
     };
   }
 
-  const executionMessage = canonicalMessageForExecution(runtimeMessage);
+  const executionMessage = canonicalMessageForExecution(scopedRuntimeMessage);
   let runtimeContext = {};
-  if (runtimeMessage?.group_id) {
+  if (effectiveGroupId) {
     try {
-      runtimeContext = await fetchRuntimeContext(runtimeMessage.group_id, state);
+      runtimeContext = await fetchRuntimeContext(effectiveGroupId, state);
     } catch {
       runtimeContext = {};
     }
   }
 
-  let execution;
-  try {
-    execution = await executeTask(executionMessage, state, runtimeContext, judgment);
-  } catch (error) {
-    console.error(JSON.stringify({ ok: false, execution_error: String(error?.message || error || "unknown execution error") }, null, 2));
-    execution = {
-      should_send: false,
-      flow_type: "run",
-      message_type: "analysis",
-      text: "",
-      payload: {},
-      reason: "execution_failed",
+  const ownershipDecision = protocolTurnOwnershipDecision(
+    state,
+    executionMessage,
+    runtimeContext,
+    judgment,
+  );
+  if (!ownershipDecision.owned) {
+    return {
+      ...judgment,
+      observed: true,
+      no_action: true,
+      protocol_turn_ownership: ownershipDecision,
+      decision: {
+        action: "observe_only",
+        reason: ownershipDecision.reason,
+      },
     };
+  }
+  if (pendingFormalSignalAlreadyObservedByCurrentAgent(state, runtimeContext)) {
+    return {
+      ...judgment,
+      observed: true,
+      no_action: true,
+      protocol_turn_ownership: ownershipDecision,
+      decision: {
+        action: "observe_only",
+        reason: "pending_formal_signal_already_observed",
+      },
+    };
+  }
+
+  let execution;
+  const deterministicBootstrapExecution = deterministicBootstrapControlTurnExecution(
+    state,
+    runtimeContext,
+    executionMessage,
+    judgment,
+  );
+  const deterministicOrganizerKickoff = deterministicOrganizerKickoffExecution(
+    state,
+    runtimeContext,
+    executionMessage,
+  );
+  const deterministicStageOwnerKickoff = deterministicStageOwnerKickoffExecution(
+    state,
+    runtimeContext,
+    executionMessage,
+  );
+  const eagerDeterministicPendingExecution =
+    firstNonEmpty(dictValue(runtimeContext?.runtime_session_card).current_mode) === "bootstrap"
+      ? deterministicPendingFormalSignalExecution(
+          state,
+          runtimeContext,
+          executionMessage,
+          {
+            reason: "deterministic_pending_formal_signal_bootstrap",
+          },
+        )
+      : null;
+  if (deterministicBootstrapExecution) {
+    execution = deterministicBootstrapExecution;
+  } else if (deterministicOrganizerKickoff) {
+    execution = deterministicOrganizerKickoff;
+  } else if (deterministicStageOwnerKickoff) {
+    execution = deterministicStageOwnerKickoff;
+  } else if (eagerDeterministicPendingExecution) {
+    execution = eagerDeterministicPendingExecution;
+  } else {
+    try {
+      execution = await executeTask(executionMessage, state, runtimeContext, judgment);
+    } catch (error) {
+      console.error(JSON.stringify({ ok: false, execution_error: String(error?.message || error || "unknown execution error") }, null, 2));
+      execution = {
+        should_send: false,
+        flow_type: "run",
+        message_type: "analysis",
+        text: "",
+        payload: {},
+        reason: "execution_failed",
+      };
+    }
+  }
+
+  const consumerFollowUpFallback =
+    obligation === "required" &&
+    (!execution?.should_send || !String(execution?.text || "").trim())
+      ? actionModuleConsumerFollowUpFallback(execution, executionMessage, runtimeContext, state)
+      : null;
+  if (consumerFollowUpFallback) {
+    execution = consumerFollowUpFallback;
+  }
+
+  const deterministicFallback =
+    consumerFollowUpFallback
+      ? null
+      : deterministicPendingFormalSignalExecution(
+          state,
+          runtimeContext,
+          executionMessage,
+          execution,
+        );
+  if (
+    deterministicFallback &&
+    (
+      !execution?.should_send ||
+      !String(execution?.text || "").trim() ||
+      !executionSatisfiesPendingFormalSignal(execution, runtimeContext)
+    )
+  ) {
+    execution = deterministicFallback;
   }
 
   if (!execution?.should_send || !String(execution?.text || "").trim()) {
@@ -2362,8 +4688,8 @@ async function executeRuntimeJudgment(state, judgment) {
     };
   }
 
-  const result = await sendCommunityMessage(state, incomingMessageForRuntime(runtimeMessage), {
-    group_id: runtimeMessage.group_id,
+  const result = await sendCommunityMessage(state, incomingMessageForRuntime(scopedRuntimeMessage), {
+    group_id: effectiveGroupId,
     flow_type: execution.flow_type || "run",
     message_type: execution.message_type || "analysis",
     content: {
@@ -2373,12 +4699,12 @@ async function executeRuntimeJudgment(state, judgment) {
     status_block: execution.status_block || {},
     context_block: execution.context_block || {},
     relations: {
-      thread_id: firstNonEmpty(execution.relations?.thread_id, runtimeMessage.thread_id, runtimeMessage.id) || null,
-      parent_message_id: firstNonEmpty(execution.relations?.parent_message_id, runtimeMessage.id) || null,
+      thread_id: firstNonEmpty(execution.relations?.thread_id, scopedRuntimeMessage.thread_id, scopedRuntimeMessage.id) || null,
+      parent_message_id: firstNonEmpty(execution.relations?.parent_message_id, scopedRuntimeMessage.id) || null,
     },
     routing: {
       target: {
-        agent_id: firstNonEmpty(execution.routing?.target?.agent_id, runtimeMessage.author_agent_id) || null,
+        agent_id: firstNonEmpty(execution.routing?.target?.agent_id, scopedRuntimeMessage.author_agent_id) || null,
       },
       mentions: listValue(execution.routing?.mentions),
     },
@@ -2406,6 +4732,13 @@ async function executeRuntimeJudgment(state, judgment) {
 function parseActiveSendPayload(raw) {
   const payload = raw && typeof raw === "object" ? raw : {};
   const content = payload.content && typeof payload.content === "object" ? { ...payload.content } : {};
+  const contentPayload = dictValue(content.payload);
+  if (payload.action_id && !contentPayload.action_id) {
+    content.payload = {
+      ...contentPayload,
+      action_id: payload.action_id,
+    };
+  }
   return {
     group_id: payload.group_id || null,
     thread_id: payload.thread_id || payload.relations?.thread_id || null,
@@ -2421,6 +4754,7 @@ function parseActiveSendPayload(raw) {
     status_block: dictValue(payload.status_block || payload.statusBlock),
     context_block: dictValue(payload.context_block || payload.contextBlock),
     content,
+    action_id: payload.action_id || content.payload?.action_id || null,
   };
 }
 

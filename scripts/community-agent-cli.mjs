@@ -88,6 +88,12 @@ function loadEnvFile(envPath) {
 let runtimePromise = null;
 let loadedContext = null;
 const COMMAND_TIMEOUT_MS = Number(process.env.COMMUNITY_CLI_TIMEOUT_MS || '45000');
+const ACTION_MODULE_LIVE_TIMEOUT_MS = Number(
+  process.env.COMMUNITY_ACTION_MODULE_LIVE_TIMEOUT_MS || '180000',
+);
+const ACTION_MODULE_LIVE_RUN_TIMEOUT_MS = Number(
+  process.env.COMMUNITY_ACTION_MODULE_LIVE_RUN_TIMEOUT_MS || '600000',
+);
 const COMMAND_REQUEST_TIMEOUT_MS = Number(process.env.COMMUNITY_CLI_REQUEST_TIMEOUT_MS || '90000');
 const SEND_IDEMPOTENCY_TTL_MS = Number(process.env.COMMUNITY_SEND_IDEMPOTENCY_TTL_MS || '600000');
 let currentCommand = 'status';
@@ -110,6 +116,11 @@ function loadJsonFile(filePath, fallback = null) {
 function boolOption(value) {
   const normalized = String(value || '').trim().toLowerCase();
   return normalized === '1' || normalized === 'true' || normalized === 'yes';
+}
+
+function numericOption(value, fallback) {
+  const parsed = Number(String(value ?? '').trim());
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function commandExists(bin) {
@@ -598,7 +609,24 @@ async function withSendRequestSuccessHandling(idempotencyKey, callback) {
   }
 }
 
-function startCommandWatchdog() {
+function resolveCommandTimeoutMs(command, options = {}) {
+  const requested = numericOption(
+    options['command-timeout-ms'] || options.command_timeout_ms,
+    null,
+  );
+  if (requested) {
+    return requested;
+  }
+  if (command === 'action-module-live-run') {
+    return Math.max(COMMAND_TIMEOUT_MS, ACTION_MODULE_LIVE_RUN_TIMEOUT_MS);
+  }
+  if (command === 'action-module-live') {
+    return Math.max(COMMAND_TIMEOUT_MS, ACTION_MODULE_LIVE_TIMEOUT_MS);
+  }
+  return COMMAND_TIMEOUT_MS;
+}
+
+function startCommandWatchdog(timeoutMs) {
   const timer = setTimeout(async () => {
     console.error(
       JSON.stringify(
@@ -607,7 +635,7 @@ function startCommandWatchdog() {
           timeout: true,
           command: currentCommand,
           phase: currentPhase,
-          timeoutMs: COMMAND_TIMEOUT_MS,
+          timeoutMs,
         },
         null,
         2,
@@ -615,7 +643,7 @@ function startCommandWatchdog() {
     );
     await flushStreams();
     process.exit(124);
-  }, COMMAND_TIMEOUT_MS);
+  }, timeoutMs);
   timer.unref();
   return timer;
 }
@@ -1330,6 +1358,38 @@ async function cmdOnboardingSelect(options) {
   }, null, 2));
 }
 
+async function cmdActionModuleLive(options) {
+  trace('action-module-live.command_start');
+  await getRuntime();
+  const moduleUrl = pathToFileURL(path.join(SKILL_ROOT, 'scripts', 'action_module_live', 'index.mjs')).href;
+  const actionModuleLive = await import(moduleUrl);
+  const result = await actionModuleLive.runActionModuleLiveCommand({
+    options,
+    workspaceRoot: loadedContext?.workspaceRoot || resolveWorkspaceRoot(),
+  });
+  console.log(JSON.stringify({
+    ok: true,
+    command: 'action-module-live',
+    ...result,
+  }, null, 2));
+}
+
+async function cmdActionModuleLiveRun(options) {
+  trace('action-module-live-run.command_start');
+  await getRuntime();
+  const moduleUrl = pathToFileURL(path.join(SKILL_ROOT, 'scripts', 'action_module_live', 'runner.mjs')).href;
+  const actionModuleLiveRunner = await import(moduleUrl);
+  const result = await actionModuleLiveRunner.runActionModuleLiveRunnerCommand({
+    options,
+    workspaceRoot: loadedContext?.workspaceRoot || resolveWorkspaceRoot(),
+  });
+  console.log(JSON.stringify({
+    ok: true,
+    command: 'action-module-live-run',
+    ...result,
+  }, null, 2));
+}
+
 async function main() {
   const { positional, options } = parseArgs(process.argv.slice(2));
   const command = positional[0] || "status";
@@ -1378,6 +1438,14 @@ async function main() {
     await cmdOnboardingSelect(options);
     return;
   }
+  if (command === 'action-module-live') {
+    await cmdActionModuleLive(options);
+    return;
+  }
+  if (command === 'action-module-live-run') {
+    await cmdActionModuleLiveRun(options);
+    return;
+  }
   if (command === 'cleanup-local-state') {
     await cmdCleanupLocalState(options);
     return;
@@ -1385,7 +1453,9 @@ async function main() {
   throw new Error(`unknown command: ${command}`);
 }
 
-const watchdog = startCommandWatchdog();
+const INITIAL_ARGS = parseArgs(process.argv.slice(2));
+currentCommand = INITIAL_ARGS.positional[0] || "status";
+const watchdog = startCommandWatchdog(resolveCommandTimeoutMs(currentCommand, INITIAL_ARGS.options));
 
 main()
   .then(async () => {
